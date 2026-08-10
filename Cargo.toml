@@ -8,6 +8,7 @@ members = [
   "crates/openwork-installer",
   "crates/openwork-platform",
   "crates/openwork-runtime",
+  "crates/openwork-sandbox",
 ]
 resolver = "2"
 
