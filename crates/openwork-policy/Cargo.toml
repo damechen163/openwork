@@ -1,0 +1,20 @@
+[package]
+name = "openwork-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+openwork-core = { path = "../openwork-core" }
+openwork-execution = { path = "../openwork-execution" }
+serde.workspace = true
+yaml_serde = "=0.10.4"
+
+[dev-dependencies]
+jsonschema.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

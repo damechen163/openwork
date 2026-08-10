@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openwork.dev/contracts/policy/policy.v1.schema.json",
+  "title": "OpenWork M1 Policy Configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "defaults", "actions"],
+  "properties": {
+    "version": { "type": "integer", "const": 1 },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unknown"],
+      "properties": { "unknown": { "const": "deny" } }
+    },
+    "actions": {
+      "type": "object",
+      "propertyNames": { "pattern": "^[a-z][a-z0-9._-]{0,127}$" },
+      "additionalProperties": { "$ref": "#/$defs/actionRule" }
+    }
+  },
+  "$defs": {
+    "decision": { "enum": ["allow", "deny", "approval"] },
+    "resourceRules": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exact", "default"],
+      "properties": {
+        "exact": {
+          "type": "object",
+          "propertyNames": { "minLength": 1, "maxLength": 2048, "pattern": "^(?!\\s*$)[\\s\\S]+$" },
+          "additionalProperties": { "$ref": "#/$defs/decision" }
+        },
+        "default": { "$ref": "#/$defs/decision" }
+      }
+    },
+    "actionRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["risk", "decision"],
+      "properties": {
+        "risk": { "enum": ["L0", "L1", "L2", "L3", "L4"] },
+        "decision": { "$ref": "#/$defs/decision" },
+        "resources": { "$ref": "#/$defs/resourceRules" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "risk": { "enum": ["L2", "L3"] } }, "required": ["risk"] },
+          "then": {
+            "properties": {
+              "decision": { "enum": ["deny", "approval"] },
+              "resources": {
+                "properties": {
+                  "exact": { "additionalProperties": { "enum": ["deny", "approval"] } },
+                  "default": { "enum": ["deny", "approval"] }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "risk": { "const": "L4" } }, "required": ["risk"] },
+          "then": {
+            "properties": {
+              "decision": { "const": "deny" },
+              "resources": {
+                "properties": {
+                  "exact": { "additionalProperties": { "const": "deny" } },
+                  "default": { "const": "deny" }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
