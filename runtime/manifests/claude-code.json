@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "metadata": {
+    "id": "claude-code",
+    "name": "Claude Code",
+    "upstream": "https://github.com/anthropics/claude-code",
+    "license": "Anthropic commercial terms",
+    "distribution": "external_managed"
+  },
+  "capabilities": {
+    "install": true,
+    "uninstall": false,
+    "update": true,
+    "authenticate": true,
+    "run": false,
+    "cancel": false
+  },
+  "installer_sources": [
+    {
+      "os": "macos-linux",
+      "architecture": "arm64-x64",
+      "environment": "native-wsl",
+      "url": "https://claude.ai/install.sh",
+      "verification": "unavailable"
+    },
+    {
+      "os": "windows",
+      "architecture": "x64",
+      "environment": "native",
+      "url": "https://claude.ai/install.ps1",
+      "verification": "unavailable"
+    }
+  ]
+}

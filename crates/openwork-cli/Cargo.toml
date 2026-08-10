@@ -16,6 +16,7 @@ openwork-core = { path = "../openwork-core" }
 openwork-doctor = { path = "../openwork-doctor" }
 openwork-installer = { path = "../openwork-installer" }
 openwork-platform = { path = "../openwork-platform" }
+openwork-runtime = { path = "../openwork-runtime" }
 serde.workspace = true
 serde_json.workspace = true
 

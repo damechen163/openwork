@@ -3,8 +3,13 @@ use openwork_core::{ErrorCode, OpenWorkError, PRODUCT_NAME};
 use openwork_doctor::{CheckStatus, DoctorReport, inspect_platform};
 use openwork_installer::{InstallPlan, dry_run_plan};
 use openwork_platform::{PlatformInfo, PlatformProbe, SystemPlatformProbe, detect};
+use openwork_runtime::{
+    AgentRuntime, AuthStatus, ClaudeRuntime, DetectionState, RuntimeCapabilities, RuntimeId,
+    RuntimeMetadata, RuntimeRegistry, SystemCommandRunner,
+};
 use serde::Serialize;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -68,8 +73,11 @@ struct StatusReport {
 
 #[derive(Serialize)]
 struct RuntimeSummary {
-    id: String,
-    state: String,
+    metadata: RuntimeMetadata,
+    detection: DetectionState,
+    version: Option<String>,
+    auth: AuthStatus,
+    capabilities: RuntimeCapabilities,
 }
 
 fn main() -> ExitCode {
@@ -114,11 +122,13 @@ fn execute(cli: Cli, probe: &impl PlatformProbe) -> Result<u8, (OpenWorkError, b
             Ok(0)
         }
         Command::Status { json } => {
+            let host = platform(probe, json)?;
+            let runtimes = runtime_summaries(&runtime_registry(&host), json)?;
             let report = StatusReport {
                 schema_version: 1,
                 state: "not_installed",
-                platform: platform(probe, json)?,
-                runtimes: Vec::new(),
+                platform: host,
+                runtimes,
             };
             render_status(&report, json);
             Ok(0)
@@ -135,28 +145,97 @@ fn execute(cli: Cli, probe: &impl PlatformProbe) -> Result<u8, (OpenWorkError, b
         Command::Runtime {
             command: RuntimeCommand::List { json },
         } => {
-            let runtimes: Vec<RuntimeSummary> = Vec::new();
+            let host = platform(probe, json)?;
+            let runtimes = runtime_summaries(&runtime_registry(&host), json)?;
             if json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&runtimes).unwrap_or_default()
                 );
             } else {
-                println!("No runtimes registered yet.");
+                for runtime in &runtimes {
+                    println!(
+                        "{}\t{:?}\t{}",
+                        runtime.metadata.id,
+                        runtime.detection,
+                        runtime.version.as_deref().unwrap_or("unknown")
+                    );
+                }
             }
             Ok(0)
         }
         Command::Runtime {
             command: RuntimeCommand::Info { id, json },
-        } => Err((
-            OpenWorkError::new(
-                ErrorCode::RuntimeNotFound,
-                format!("runtime `{id}` is not registered"),
-            )
-            .with_remediation("Run `openwork runtime list` to see available runtimes."),
-            json,
-        )),
+        } => {
+            let host = platform(probe, json)?;
+            let registry = runtime_registry(&host);
+            let runtime = registry.get(&RuntimeId::from(id.as_str())).ok_or_else(|| {
+                (
+                    OpenWorkError::new(
+                        ErrorCode::RuntimeNotFound,
+                        format!("runtime `{id}` is not registered"),
+                    )
+                    .with_remediation("Run `openwork runtime list` to see available runtimes."),
+                    json,
+                )
+            })?;
+            let summary = runtime_summary(runtime.as_ref()).map_err(|error| (error, json))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&summary).unwrap_or_default()
+                );
+            } else {
+                println!("Runtime: {}", summary.metadata.name);
+                println!("State: {:?}", summary.detection);
+                println!(
+                    "Version: {}",
+                    summary.version.as_deref().unwrap_or("unknown")
+                );
+                println!("Auth: {:?}", summary.auth);
+                println!("Distribution: {:?}", summary.metadata.distribution);
+            }
+            Ok(0)
+        }
     }
+}
+
+fn runtime_registry(host: &PlatformInfo) -> RuntimeRegistry {
+    let mut registry = RuntimeRegistry::new();
+    registry
+        .register(Arc::new(ClaudeRuntime::new(
+            Arc::new(SystemCommandRunner),
+            None,
+            host.clone(),
+        )))
+        .expect("built-in runtime ids are unique");
+    registry
+}
+
+fn runtime_summaries(
+    registry: &RuntimeRegistry,
+    json: bool,
+) -> Result<Vec<RuntimeSummary>, (OpenWorkError, bool)> {
+    registry
+        .metadata()
+        .into_iter()
+        .map(|metadata| {
+            registry
+                .get(&metadata.id)
+                .expect("metadata came from this registry")
+        })
+        .map(|runtime| runtime_summary(runtime.as_ref()).map_err(|error| (error, json)))
+        .collect()
+}
+
+fn runtime_summary(runtime: &dyn AgentRuntime) -> Result<RuntimeSummary, OpenWorkError> {
+    Ok(RuntimeSummary {
+        metadata: runtime.metadata(),
+        detection: runtime.detect()?.state,
+        version: runtime.version()?,
+        auth: runtime.auth_status()?,
+        capabilities: runtime.capabilities(),
+    })
 }
 
 fn platform(probe: &impl PlatformProbe, json: bool) -> Result<PlatformInfo, (OpenWorkError, bool)> {
