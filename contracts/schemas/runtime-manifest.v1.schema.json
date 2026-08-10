@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openwork.dev/schemas/runtime-manifest.v1.schema.json",
+  "title": "OpenWork Runtime Manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "metadata", "capabilities", "installer_sources"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "upstream", "license", "distribution"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "upstream": { "type": "string", "format": "uri" },
+        "license": { "type": "string", "minLength": 1 },
+        "distribution": { "enum": ["external_managed", "embedded"] }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["install", "uninstall", "update", "authenticate", "run", "cancel"],
+      "properties": {
+        "install": { "type": "boolean" },
+        "uninstall": { "type": "boolean" },
+        "update": { "type": "boolean" },
+        "authenticate": { "type": "boolean" },
+        "run": { "type": "boolean" },
+        "cancel": { "type": "boolean" }
+      }
+    },
+    "installer_sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["os", "architecture", "environment", "url", "verification"],
+        "properties": {
+          "os": { "type": "string", "minLength": 1 },
+          "architecture": { "type": "string", "minLength": 1 },
+          "environment": { "type": "string", "minLength": 1 },
+          "url": { "type": "string", "format": "uri", "pattern": "^https://" },
+          "verification": {
+            "enum": ["official_checksum_required", "observed_checksum", "unavailable"]
+          }
+        }
+      }
+    }
+  }
+}

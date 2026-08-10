@@ -1,5 +1,14 @@
 //! Runtime contracts, registry, manifests, and external-managed adapters.
 
+mod manifest;
+mod registry;
+
+pub use manifest::{
+    InstallerSource, RUNTIME_MANIFEST_SCHEMA_VERSION, RuntimeManifest, VerificationPolicy,
+    parse_manifest_json,
+};
+pub use registry::RuntimeRegistry;
+
 use openwork_core::OpenWorkError;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -17,6 +26,18 @@ pub type RuntimeResult<T> = Result<T, OpenWorkError>;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct RuntimeId(pub String);
+
+impl From<&str> for RuntimeId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+impl std::fmt::Display for RuntimeId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
