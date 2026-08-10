@@ -1,3 +1,7 @@
+/target/
+/installer/cli/dist/
+*.tmp
+*.bak
 .DS_Store
 .env
 .env.*

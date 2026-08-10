@@ -1,0 +1,25 @@
+[workspace]
+members = [
+  "crates/openwork-cli",
+  "crates/openwork-config",
+  "crates/openwork-core",
+  "crates/openwork-doctor",
+  "crates/openwork-installer",
+  "crates/openwork-platform",
+  "crates/openwork-runtime",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/shichenghaoshu/openwork"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
