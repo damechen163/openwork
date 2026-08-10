@@ -2,4 +2,7 @@
 /.github/ @shichenghaoshu
 /docs/adr/ @shichenghaoshu
 /installer/ @shichenghaoshu
+/crates/ @shichenghaoshu
+/Cargo.toml @shichenghaoshu
+/Cargo.lock @shichenghaoshu
 /third_party/ @shichenghaoshu
