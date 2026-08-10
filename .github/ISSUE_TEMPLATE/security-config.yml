@@ -1,0 +1,28 @@
+name: Security configuration hardening
+description: Propose a non-sensitive security-default improvement. Vulnerabilities must be reported privately.
+title: "[Security config]: "
+labels: ["type:security"]
+body:
+  - type: markdown
+    attributes:
+      value: "Do not disclose vulnerabilities here. Follow SECURITY.md for private reporting."
+  - type: textarea
+    id: current
+    attributes: { label: Current safe-default gap }
+    validations: { required: true }
+  - type: textarea
+    id: proposal
+    attributes: { label: Proposed configuration }
+    validations: { required: true }
+  - type: textarea
+    id: threats
+    attributes: { label: Threats addressed and residual risk }
+    validations: { required: true }
+  - type: textarea
+    id: tests
+    attributes: { label: Verification plan }
+    validations: { required: true }
+  - type: textarea
+    id: rollback
+    attributes: { label: Compatibility and rollback }
+    validations: { required: true }

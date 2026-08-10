@@ -1,0 +1,122 @@
+apiVersion: openwork.ai/v1
+kind: UpstreamVersionLock
+reviewedAt: "2026-08-10"
+components:
+  librechat:
+    version: "v0.8.7"
+    commit: "9e74cc0e57b395926122bd4062c1fcedc48ed465"
+    repository: "https://github.com/danny-avila/LibreChat"
+    license: "MIT"
+    image: null
+    digest: null
+    tested: false
+    status: "blocked-upstream"
+    blocker: "Official release-correlated image tag unavailable; do not consume latest."
+  litellm:
+    version: "v1.95.0"
+    commit: "72a4a55f43ea7266de589f005d0d33624fe5d555"
+    repository: "https://github.com/BerriAI/litellm"
+    license: "MIT outside enterprise/"
+    image: "ghcr.io/berriai/litellm:v1.95.0"
+    digest: "sha256:af806882b7a6ced41658db5b6a7e98ed7b9b51d03b935e0417bf1c8552d688af"
+    tested: false
+    status: "candidate"
+  goose:
+    version: "v1.45.0"
+    commit: "4dc0420f5704a92806c6628c8f0a3497d7a88759"
+    repository: "https://github.com/aaif-goose/goose"
+    license: "Apache-2.0"
+    image: "ghcr.io/aaif-goose/goose:v1.45.0"
+    digest: "sha256:3e2f39d15e26198f14807966109cb48992156390b969d4f292d84663e5e161bc"
+    tested: false
+    status: "candidate"
+  unstructured-api:
+    version: "0.1.2"
+    commit: "d57d709208d388a210a97733e9f6d5c93251ac2a"
+    repository: "https://github.com/Unstructured-IO/unstructured-api"
+    license: "Apache-2.0"
+    image: "downloads.unstructured.io/unstructured-io/unstructured-api:0.1.2"
+    digest: "sha256:986bc7e5d6c24916c22d45d925db366f55bf4d2ebb0079a7b5d38b48fbc6fb1d"
+    tested: false
+    status: "candidate"
+  postgres-pgvector:
+    version: "PostgreSQL 18.4 / pgvector v0.8.6"
+    commit: "8ee86c96f0fd72390f890aa8a336fda6d3ab4c6c"
+    repository: "https://github.com/pgvector/pgvector"
+    license: "PostgreSQL License"
+    image: "docker.io/pgvector/pgvector:0.8.6-pg18-trixie"
+    digest: "sha256:1963bc48febf543433baa1ce3edcc6cc08154de722e22495f86681cc9a849026"
+    tested: false
+    status: "candidate"
+  gvisor:
+    version: "release-20260803.0"
+    commit: "48de7274186ae2cbab2c8656c43a73d115227a61"
+    repository: "https://github.com/google/gvisor"
+    license: "Apache-2.0"
+    image: null
+    digest: null
+    tested: false
+    status: "optional"
+  activepieces:
+    version: "0.87.0"
+    commit: "fb9bc5ceb0f9fa580d2dfe844bda219c0202637f"
+    repository: "https://github.com/activepieces/activepieces"
+    license: "MIT CE; commercial EE paths excluded"
+    image: "ghcr.io/activepieces/activepieces:0.87.0"
+    digest: "sha256:6a1cc5b699f3c66798ea16079e3c66597462edc2765066b63e791327986c0985"
+    tested: false
+    status: "optional"
+  langfuse-web:
+    version: "v4.6.0"
+    commit: "328bb23d8ed71c5879d036704a7077c10516d462"
+    repository: "https://github.com/langfuse/langfuse"
+    license: "MIT core; commercial EE paths excluded"
+    image: "docker.io/langfuse/langfuse:4.6.0"
+    digest: "sha256:2e535d8e163c78f5c7162773280578c7e7aafe3b0589fc60a9a1225746b60fc7"
+    tested: false
+    status: "optional"
+  langfuse-worker:
+    version: "v4.6.0"
+    commit: "328bb23d8ed71c5879d036704a7077c10516d462"
+    repository: "https://github.com/langfuse/langfuse"
+    license: "MIT core; commercial EE paths excluded"
+    image: "docker.io/langfuse/langfuse-worker:4.6.0"
+    digest: "sha256:fcbf2ee82fa3f133c32c9ba0b5036fbd6e30466df0958a0a37e52f343b340d1b"
+    tested: false
+    status: "optional"
+  ragflow:
+    version: "v0.26.4"
+    commit: "cb93883f3f8c975eecb2fed81210effeb3bdb06f"
+    repository: "https://github.com/infiniflow/ragflow"
+    license: "Apache-2.0"
+    image: "docker.io/infiniflow/ragflow:v0.26.4"
+    digest: "sha256:16d24d1968ab59e2715a85d2590f1569c9539e0362344a42f3a23e8be06a655b"
+    tested: false
+    status: "optional"
+  mineru:
+    version: "3.4.4"
+    commit: "0dfc9460cd9ab693b9af60ae3fbffd7bc111b062"
+    repository: "https://github.com/opendatalab/MinerU"
+    license: "MinerU Open Source License"
+    image: null
+    digest: null
+    tested: false
+    status: "blocked-licensing"
+  new-api:
+    version: "v1.0.0-rc.24"
+    commit: "5c3abffe8572aa8a49f15c3916707d2019d66af4"
+    repository: "https://github.com/QuantumNous/new-api"
+    license: "AGPL-3.0"
+    image: "docker.io/calciumion/new-api:v1.0.0-rc.24"
+    digest: "sha256:be4b1f3fb48687cab0e0ff921a1e4c69ae3738c0907ce05646ddc6da02cb35a5"
+    tested: false
+    status: "external-optional"
+  claude-code:
+    version: "v2.1.226"
+    commit: "2bb60696142b493eafaeacfe00eac51d16c50c4f"
+    repository: "https://github.com/anthropics/claude-code"
+    license: "Proprietary - Anthropic Commercial Terms"
+    image: null
+    digest: null
+    tested: false
+    status: "external-only-no-redistribution"
