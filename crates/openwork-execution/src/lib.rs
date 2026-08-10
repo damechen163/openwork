@@ -1,5 +1,6 @@
 //! Frozen M1 contracts for safe task execution.
 
+pub mod artifact;
 pub mod audit;
 pub mod orchestrator;
 pub mod store;

@@ -1,8 +1,12 @@
 //! Thin orchestration layer that never persists raw prompts or artifact contents.
 
+use crate::artifact::ArtifactScanner;
 use crate::audit::AuditAppend;
 use crate::store::ExecutionStore;
-use crate::{ActorId, EXECUTION_SCHEMA_VERSION, Run, RunId, RunStatus, UtcTimestamp, sha256_bytes};
+use crate::{
+    ActorId, Artifact, EXECUTION_SCHEMA_VERSION, RelativeArtifactPath, Run, RunId, RunStatus,
+    UtcTimestamp, sha256_bytes,
+};
 use openwork_core::{ErrorCode, OpenWorkError};
 use std::fs;
 use std::path::Path;
@@ -10,12 +14,13 @@ use std::path::Path;
 /// Coordinates run persistence while delegating execution to later M1 integrations.
 pub struct ExecutionOrchestrator<S> {
     store: S,
+    scanner: ArtifactScanner,
 }
 
 impl<S: ExecutionStore> ExecutionOrchestrator<S> {
     #[must_use]
-    pub const fn new(store: S) -> Self {
-        Self { store }
+    pub const fn new(store: S, scanner: ArtifactScanner) -> Self {
+        Self { store, scanner }
     }
 
     /// Creates a queued run from a trusted actor; only the prompt digest is persisted.
@@ -80,6 +85,28 @@ impl<S: ExecutionStore> ExecutionOrchestrator<S> {
     ) -> Result<Run, OpenWorkError> {
         self.store
             .transition_run(run_id, expected_revision, next, reason, audit(actor, now))
+    }
+
+    /// Validates every claimed output before atomically recording the artifact batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsafe output or an atomic persistence failure.
+    pub fn record_artifacts(
+        &self,
+        run_id: &RunId,
+        output_root: &Path,
+        paths: &[RelativeArtifactPath],
+        actor: ActorId,
+        created_at: UtcTimestamp,
+    ) -> Result<Vec<Artifact>, OpenWorkError> {
+        let artifacts = self.scanner.scan(run_id, output_root, paths, created_at)?;
+        self.store.record_artifacts(
+            run_id,
+            artifacts.clone(),
+            audit(actor, created_at),
+        )?;
+        Ok(artifacts)
     }
 
     #[must_use]

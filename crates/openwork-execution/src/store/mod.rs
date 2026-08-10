@@ -47,6 +47,7 @@ pub trait ExecutionStore: Send + Sync {
         &self,
         run_id: &RunId,
         artifacts: Vec<Artifact>,
+        audit: AuditAppend,
     ) -> Result<(), OpenWorkError>;
     /// Reads one run.
     ///
@@ -129,7 +130,12 @@ impl ExecutionStore for InMemoryExecutionStore {
             .checked_add(1)
             .ok_or_else(|| internal_error("audit sequence overflow"))?;
         let previous = events.last().map(|event| event.event_hash().clone());
-        let event = audit.build(run_id.clone(), sequence, transition_event(next), previous)?;
+        let event = audit.with_run_status(next).build(
+            run_id.clone(),
+            sequence,
+            transition_event(next),
+            previous,
+        )?;
 
         let mut updated = current;
         updated.status = next;
@@ -190,6 +196,7 @@ impl ExecutionStore for InMemoryExecutionStore {
         &self,
         run_id: &RunId,
         artifacts: Vec<Artifact>,
+        audit: AuditAppend,
     ) -> Result<(), OpenWorkError> {
         let mut state = self.lock()?;
         if !state.runs.contains_key(run_id)
@@ -209,7 +216,7 @@ impl ExecutionStore for InMemoryExecutionStore {
                 "artifact media type is empty",
             ));
         }
-        let existing = state.artifacts.entry(run_id.clone()).or_default();
+        let existing = state.artifacts.get(run_id).cloned().unwrap_or_default();
         if artifacts.iter().any(|candidate| {
             existing.iter().any(|stored| stored.path == candidate.path)
                 || artifacts
@@ -223,7 +230,43 @@ impl ExecutionStore for InMemoryExecutionStore {
                 "duplicate artifact path",
             ));
         }
-        existing.extend(artifacts);
+        let audit_chain = state.audits.get(run_id).ok_or_else(audit_missing)?;
+        if audit_chain
+            .last()
+            .is_some_and(|event| audit.timestamp < event.timestamp)
+        {
+            return Err(state_error("audit timestamps cannot move backwards"));
+        }
+        let mut previous = audit_chain.last().map(|event| event.event_hash().clone());
+        let mut next_sequence = u64::try_from(audit_chain.len())
+            .map_err(|_| internal_error("audit sequence overflow"))?
+            .checked_add(1)
+            .ok_or_else(|| internal_error("audit sequence overflow"))?;
+        let mut events = Vec::with_capacity(artifacts.len());
+        for artifact in &artifacts {
+            let append = audit.clone().with_artifact(artifact);
+            let event = append.build(
+                run_id.clone(),
+                next_sequence,
+                AuditEventType::ArtifactCreated,
+                previous,
+            )?;
+            previous = Some(event.event_hash().clone());
+            next_sequence = next_sequence
+                .checked_add(1)
+                .ok_or_else(|| internal_error("audit sequence overflow"))?;
+            events.push(event);
+        }
+        state
+            .artifacts
+            .entry(run_id.clone())
+            .or_default()
+            .extend(artifacts);
+        state
+            .audits
+            .get_mut(run_id)
+            .ok_or_else(audit_missing)?
+            .extend(events);
         Ok(())
     }
 
