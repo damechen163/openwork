@@ -1,5 +1,8 @@
 //! Frozen M1 contracts for safe task execution.
 
+pub mod audit;
+pub mod store;
+
 use openwork_core::{ErrorCode, OpenWorkError, redact_json};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
