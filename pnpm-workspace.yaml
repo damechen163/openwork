@@ -1,7 +1,0 @@
-packages:
-  - apps/*
-  - installer/*
-  - runtime/*
-  - adapters/*/*
-  - packs/*
-  - contracts/*

@@ -8,111 +8,72 @@ on:
 permissions:
   contents: read
 
-env:
-  NODE_VERSION: "24"
-
 jobs:
-  rust-fmt:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: rustup component add rustfmt
       - run: cargo fmt --all --check
 
-  rust-clippy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup component add clippy
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-
-  rust-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: cargo test --workspace
-
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: "24" }
-      - run: corepack enable
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm lint
-
   typecheck:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: "24" }
-      - run: corepack enable
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm typecheck
+      - run: cargo check --workspace --all-targets --locked
 
   unit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: "24" }
-      - run: corepack enable
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm test
+      - run: cargo test --workspace --lib --locked
 
   integration:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: "24" }
-      - run: corepack enable
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm test:integration
+      - run: cargo test --workspace --tests --locked
 
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: "24" }
-      - run: corepack enable
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm build
+      - run: cargo build --release --locked
+      - run: test "$(target/release/openwork --version)" = "OpenWork 0.1.0"
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add clippy
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   compose-smoke:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Validate Phase 0 compose boundary
-        run: test ! -f installer/compose/compose.test.yml
+      - run: test ! -f installer/compose/compose.test.yml
 
   pack-validation:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Validate Phase 0 pack boundary
-        run: test ! -e contracts/schemas/capability-pack.v1.schema.json
+      - run: test ! -e contracts/schemas/capability-pack.v1.schema.json
 
   license-check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: test -s LICENSE && test -s NOTICE && test -s THIRD_PARTY_NOTICES.md
-      - run: test "$(find third_party -type f -name '*.md' | wc -l)" -ge 13
+      - run: cargo metadata --format-version 1 --locked > /tmp/openwork-cargo-metadata.json
+      - run: '! jq -e ''.packages[] | select(.license == null)'' /tmp/openwork-cargo-metadata.json'
 
   sbom:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: "24" }
-      - run: corepack enable
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm licenses list --json > /tmp/openwork-node-licenses.json
-      - run: test -s /tmp/openwork-node-licenses.json
+      - run: cargo metadata --format-version 1 --locked > /tmp/openwork-cargo-sbom-input.json
+      - run: test -s /tmp/openwork-cargo-sbom-input.json
 
   secret-scan:
     runs-on: ubuntu-latest
@@ -125,23 +86,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: "24" }
-      - run: corepack enable
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm audit --audit-level high
+      - run: rustup component add clippy
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   container-scan:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Confirm Phase 0 has no first-party container to scan
-        run: test -z "$(find . -path './node_modules' -prune -o -name Dockerfile -print -quit)"
+      - run: test -z "$(find . -path './target' -prune -o -name Dockerfile -print -quit)"
 
   docs-links:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: "24" }
       - run: node scripts/check-doc-links.mjs

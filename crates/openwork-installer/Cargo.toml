@@ -6,5 +6,9 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+openwork-platform = { path = "../openwork-platform" }
+serde.workspace = true
+
 [lints]
 workspace = true

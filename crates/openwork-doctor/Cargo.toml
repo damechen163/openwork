@@ -11,7 +11,7 @@ openwork-platform = { path = "../openwork-platform" }
 serde.workspace = true
 
 [dev-dependencies]
-serde_json = "1.0.151"
+serde_json.workspace = true
 
 [lints]
 workspace = true
