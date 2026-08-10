@@ -434,7 +434,7 @@ impl ApprovalRepository for InMemoryExecutionStore {
         let event = approval_event(
             &state,
             &updated,
-            AuditEventType::ApprovalDenied,
+            AuditEventType::ApprovalExpired,
             trusted_actor,
             trusted_now,
         )?;
@@ -494,7 +494,7 @@ impl ApprovalRepository for InMemoryExecutionStore {
         let event = approval_event(
             &state,
             &updated,
-            AuditEventType::ApprovalApproved,
+            AuditEventType::ApprovalConsumed,
             trusted_actor,
             trusted_now,
         )?;

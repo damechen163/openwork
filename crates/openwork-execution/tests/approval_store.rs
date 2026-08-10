@@ -61,6 +61,15 @@ fn approval_is_single_use_and_claims_the_exact_action() {
         store.get_action_claim(&action.id).unwrap(),
         Some(consumed.action_claim)
     );
+    assert_eq!(
+        store
+            .audit_events(&run_id())
+            .unwrap()
+            .last()
+            .unwrap()
+            .event_type,
+        openwork_execution::AuditEventType::ApprovalConsumed
+    );
     verify_audit(&store, 4);
 }
 
@@ -88,6 +97,15 @@ fn expiry_uses_now_greater_than_or_equal_to_deadline() {
         .expire_approval(&approval.id, 0, actor("system"), time(5))
         .expect("expire at deadline");
     assert_eq!(expired.status, ApprovalStatus::Expired);
+    assert_eq!(
+        store
+            .audit_events(&run_id())
+            .unwrap()
+            .last()
+            .unwrap()
+            .event_type,
+        openwork_execution::AuditEventType::ApprovalExpired
+    );
     assert!(
         store
             .consume_approval(&approval.id, 1, &action, actor("executor"), time(5))
