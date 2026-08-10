@@ -88,6 +88,7 @@ impl AgentRuntime for MockRuntime {
         Ok(RuntimeInstallPlan {
             source_url: "https://example.invalid/openwork/mock".to_owned(),
             version: version.map(str::to_owned),
+            downloads: vec![],
             commands: vec![],
             warnings: vec!["Synthetic fixture only; no command will execute.".to_owned()],
         })
