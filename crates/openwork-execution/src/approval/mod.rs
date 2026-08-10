@@ -29,7 +29,8 @@ pub struct ApprovalConsumption {
 /// `trusted_actor` from authenticated context. Neither value may be decoded from
 /// a model-authored action or public request body.
 pub trait ApprovalRepository: Send + Sync {
-    /// Persists a pending request and `approval_requested` audit event atomically.
+    /// Persists a pending request, its current run-window revision binding, and
+    /// `approval_requested` audit event atomically.
     ///
     /// # Errors
     ///
@@ -43,6 +44,8 @@ pub trait ApprovalRepository: Send + Sync {
     ) -> Result<ApprovalRequest, OpenWorkError>;
 
     /// CAS-transitions pending approval to approved or denied with one audit event.
+    /// Approval requires the exact awaiting-approval window captured at create;
+    /// denial remains available after a later transition for explicit cleanup.
     ///
     /// # Errors
     ///
@@ -57,7 +60,8 @@ pub trait ApprovalRepository: Send + Sync {
         trusted_now: UtcTimestamp,
     ) -> Result<ApprovalRequest, OpenWorkError>;
 
-    /// CAS-transitions pending or approved approval to expired at the trusted deadline.
+    /// CAS-transitions pending or approved approval to expired at the trusted deadline,
+    /// including after a terminal run transition for scheduler cleanup.
     ///
     /// # Errors
     ///
@@ -70,7 +74,9 @@ pub trait ApprovalRepository: Send + Sync {
         trusted_now: UtcTimestamp,
     ) -> Result<ApprovalRequest, OpenWorkError>;
 
-    /// Atomically consumes an exact approved binding and creates its action claim.
+    /// Atomically consumes an exact approved binding from its original awaiting
+    /// window, advances that run to running, and creates its action claim with
+    /// both audit events.
     ///
     /// # Errors
     ///
