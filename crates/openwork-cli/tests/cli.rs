@@ -59,6 +59,17 @@ fn runtime_commands_expose_registered_and_error_states() {
     let summary: serde_json::Value = serde_json::from_slice(&claude.stdout).unwrap();
     assert_eq!(summary["metadata"]["distribution"], "external_managed");
 
+    let codex = openwork()
+        .args(["runtime", "info", "codex", "--json"])
+        .output()
+        .unwrap();
+    assert!(codex.status.success());
+    let summary: serde_json::Value = serde_json::from_slice(&codex.stdout).unwrap();
+    assert_eq!(
+        summary["metadata"]["upstream"],
+        "https://github.com/openai/codex"
+    );
+
     let info = openwork()
         .args(["runtime", "info", "missing", "--json"])
         .output()
