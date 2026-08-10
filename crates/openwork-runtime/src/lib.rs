@@ -1,6 +1,7 @@
 //! Runtime contracts, registry, manifests, and external-managed adapters.
 
 mod claude;
+mod codex;
 mod manifest;
 mod mock;
 mod registry;
@@ -8,6 +9,7 @@ mod registry;
 pub mod compatibility;
 
 pub use claude::ClaudeRuntime;
+pub use codex::CodexRuntime;
 pub use manifest::{
     InstallerSource, RUNTIME_MANIFEST_SCHEMA_VERSION, RuntimeManifest, VerificationPolicy,
     parse_manifest_json,
