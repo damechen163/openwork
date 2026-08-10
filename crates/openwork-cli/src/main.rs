@@ -4,8 +4,8 @@ use openwork_doctor::{CheckStatus, DoctorReport, inspect_platform};
 use openwork_installer::{InstallPlan, dry_run_plan};
 use openwork_platform::{PlatformInfo, PlatformProbe, SystemPlatformProbe, detect};
 use openwork_runtime::{
-    AgentRuntime, AuthStatus, ClaudeRuntime, DetectionState, RuntimeCapabilities, RuntimeId,
-    RuntimeMetadata, RuntimeRegistry, SystemCommandRunner,
+    AgentRuntime, AuthStatus, ClaudeRuntime, CodexRuntime, RuntimeCapabilities, RuntimeDetection,
+    RuntimeId, RuntimeMetadata, RuntimeRegistry, SystemCommandRunner,
 };
 use serde::Serialize;
 use std::process::ExitCode;
@@ -74,7 +74,7 @@ struct StatusReport {
 #[derive(Serialize)]
 struct RuntimeSummary {
     metadata: RuntimeMetadata,
-    detection: DetectionState,
+    detection: RuntimeDetection,
     version: Option<String>,
     auth: AuthStatus,
     capabilities: RuntimeCapabilities,
@@ -157,7 +157,7 @@ fn execute(cli: Cli, probe: &impl PlatformProbe) -> Result<u8, (OpenWorkError, b
                     println!(
                         "{}\t{:?}\t{}",
                         runtime.metadata.id,
-                        runtime.detection,
+                        runtime.detection.state,
                         runtime.version.as_deref().unwrap_or("unknown")
                     );
                 }
@@ -187,13 +187,16 @@ fn execute(cli: Cli, probe: &impl PlatformProbe) -> Result<u8, (OpenWorkError, b
                 );
             } else {
                 println!("Runtime: {}", summary.metadata.name);
-                println!("State: {:?}", summary.detection);
+                println!("State: {:?}", summary.detection.state);
                 println!(
                     "Version: {}",
                     summary.version.as_deref().unwrap_or("unknown")
                 );
                 println!("Auth: {:?}", summary.auth);
                 println!("Distribution: {:?}", summary.metadata.distribution);
+                if let Some(details) = &summary.detection.details {
+                    println!("Details: {details}");
+                }
             }
             Ok(0)
         }
@@ -204,6 +207,13 @@ fn runtime_registry(host: &PlatformInfo) -> RuntimeRegistry {
     let mut registry = RuntimeRegistry::new();
     registry
         .register(Arc::new(ClaudeRuntime::new(
+            Arc::new(SystemCommandRunner),
+            None,
+            host.clone(),
+        )))
+        .expect("built-in runtime ids are unique");
+    registry
+        .register(Arc::new(CodexRuntime::new(
             Arc::new(SystemCommandRunner),
             None,
             host.clone(),
@@ -229,9 +239,10 @@ fn runtime_summaries(
 }
 
 fn runtime_summary(runtime: &dyn AgentRuntime) -> Result<RuntimeSummary, OpenWorkError> {
+    let detection = runtime.detect()?;
     Ok(RuntimeSummary {
         metadata: runtime.metadata(),
-        detection: runtime.detect()?.state,
+        detection,
         version: runtime.version()?,
         auth: runtime.auth_status()?,
         capabilities: runtime.capabilities(),

@@ -96,6 +96,11 @@ mod tests {
                 .unwrap();
         assert_eq!(claude.metadata.id, RuntimeId::from("claude-code"));
         assert_eq!(claude.installer_sources.len(), 2);
+
+        let codex =
+            parse_manifest_json(include_str!("../../../runtime/manifests/codex.json")).unwrap();
+        assert_eq!(codex.metadata.id, RuntimeId::from("codex"));
+        assert_eq!(codex.installer_sources.len(), 2);
     }
 
     #[test]

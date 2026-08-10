@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "metadata": {
+    "id": "codex",
+    "name": "Codex",
+    "upstream": "https://github.com/openai/codex",
+    "license": "Apache-2.0",
+    "distribution": "external_managed"
+  },
+  "capabilities": {
+    "install": true,
+    "uninstall": false,
+    "update": true,
+    "authenticate": true,
+    "run": false,
+    "cancel": false
+  },
+  "installer_sources": [
+    {
+      "os": "macos-linux",
+      "architecture": "arm64-x64",
+      "environment": "native-wsl",
+      "url": "https://chatgpt.com/codex/install.sh",
+      "verification": "observed_checksum"
+    },
+    {
+      "os": "windows",
+      "architecture": "x64",
+      "environment": "native",
+      "url": "https://chatgpt.com/codex/install.ps1",
+      "verification": "observed_checksum"
+    }
+  ]
+}
