@@ -4,8 +4,6 @@ use crate::audit::AuditAppend;
 use crate::store::ExecutionStore;
 use crate::{ActorId, EXECUTION_SCHEMA_VERSION, Run, RunId, RunStatus, UtcTimestamp, sha256_bytes};
 use openwork_core::{ErrorCode, OpenWorkError};
-use serde_json::Value;
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -63,8 +61,7 @@ impl<S: ExecutionStore> ExecutionOrchestrator<S> {
             completed_at: None,
             terminal_reason: None,
         };
-        self.store
-            .create_run(run, audit(actor, now, BTreeMap::new()))
+        self.store.create_run(run, audit(actor, now))
     }
 
     /// Revision-checks one state change and records the corresponding event atomically.
@@ -81,13 +78,8 @@ impl<S: ExecutionStore> ExecutionOrchestrator<S> {
         actor: ActorId,
         now: UtcTimestamp,
     ) -> Result<Run, OpenWorkError> {
-        self.store.transition_run(
-            run_id,
-            expected_revision,
-            next,
-            reason,
-            audit(actor, now, BTreeMap::new()),
-        )
+        self.store
+            .transition_run(run_id, expected_revision, next, reason, audit(actor, now))
     }
 
     #[must_use]
@@ -96,14 +88,6 @@ impl<S: ExecutionStore> ExecutionOrchestrator<S> {
     }
 }
 
-fn audit(
-    actor: ActorId,
-    timestamp: UtcTimestamp,
-    metadata: BTreeMap<String, Value>,
-) -> AuditAppend {
-    AuditAppend {
-        actor,
-        timestamp,
-        metadata,
-    }
+fn audit(actor: ActorId, timestamp: UtcTimestamp) -> AuditAppend {
+    AuditAppend::new(actor, timestamp)
 }
