@@ -1,0 +1,25 @@
+name: Upstream change
+description: Record a maintenance, API, image, or license change in a dependency.
+title: "[Upstream]: "
+labels: ["blocked:upstream"]
+body:
+  - type: input
+    id: repository
+    attributes: { label: Official repository or documentation URL }
+    validations: { required: true }
+  - type: input
+    id: version
+    attributes: { label: Version / tag / commit }
+    validations: { required: true }
+  - type: textarea
+    id: change
+    attributes: { label: Verified change and official evidence }
+    validations: { required: true }
+  - type: textarea
+    id: impact
+    attributes: { label: OpenWork compatibility, security, and license impact }
+    validations: { required: true }
+  - type: textarea
+    id: plan
+    attributes: { label: Compatibility test and rollback plan }
+    validations: { required: true }

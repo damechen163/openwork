@@ -1,0 +1,49 @@
+name: Feature
+description: Propose a scoped capability linked to user value.
+title: "[Feature]: "
+labels: ["type:feature", "needs-design"]
+body:
+  - type: textarea
+    id: problem
+    attributes: { label: Problem, description: "What concrete problem exists?" }
+    validations: { required: true }
+  - type: textarea
+    id: value
+    attributes: { label: User value, description: "Who benefits and how?" }
+    validations: { required: true }
+  - type: textarea
+    id: scope
+    attributes: { label: Scope, description: "What is included?" }
+    validations: { required: true }
+  - type: textarea
+    id: non_goals
+    attributes:
+      { label: Non-goals, description: "What is explicitly excluded?" }
+    validations: { required: true }
+  - type: textarea
+    id: acceptance
+    attributes:
+      {
+        label: Acceptance criteria,
+        description: Provide verifiable checklist items.,
+      }
+    validations: { required: true }
+  - type: textarea
+    id: security
+    attributes: { label: Security implications }
+    validations: { required: true }
+  - type: textarea
+    id: license
+    attributes: { label: License / upstream implications }
+    validations: { required: true }
+  - type: textarea
+    id: tests
+    attributes: { label: Test plan }
+    validations: { required: true }
+  - type: textarea
+    id: rollback
+    attributes: { label: Rollback plan }
+    validations: { required: true }
+  - type: textarea
+    id: dependencies
+    attributes: { label: Dependencies }

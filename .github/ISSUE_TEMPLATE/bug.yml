@@ -1,0 +1,31 @@
+name: Bug
+description: Report a reproducible defect without secrets or customer data.
+title: "[Bug]: "
+labels: ["type:bug", "needs-repro"]
+body:
+  - type: markdown
+    attributes:
+      value: "Do not include API keys, cookies, uploaded documents, authorization headers, or customer data."
+  - type: textarea
+    id: behavior
+    attributes: { label: Observed behavior }
+    validations: { required: true }
+  - type: textarea
+    id: expected
+    attributes: { label: Expected behavior }
+    validations: { required: true }
+  - type: textarea
+    id: reproduction
+    attributes: { label: Minimal reproduction }
+    validations: { required: true }
+  - type: textarea
+    id: environment
+    attributes: { label: Redacted environment and doctor output }
+    validations: { required: true }
+  - type: textarea
+    id: security
+    attributes: { label: Security / data impact }
+    validations: { required: true }
+  - type: textarea
+    id: rollback
+    attributes: { label: Workaround / rollback }
