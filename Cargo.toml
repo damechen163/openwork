@@ -23,3 +23,8 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+
+[workspace.dependencies]
+fs2 = "0.4.3"
+serde = { version = "1.0.229", features = ["derive"] }
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
