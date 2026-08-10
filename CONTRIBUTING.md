@@ -5,7 +5,7 @@ Thank you for helping make enterprise AI installation safer and more repeatable.
 1. Search existing issues and discuss architecture changes before implementation.
 2. Link every pull request to an issue and keep it to one concern.
 3. Add or adjust tests first when feasible.
-4. Run `pnpm lint`, `pnpm typecheck`, `pnpm test`, `pnpm test:integration`, and `pnpm build`.
+4. Run `cargo fmt --all --check`, strict clippy, workspace tests, and a release build.
 5. Update security, licensing, migrations, rollback, and documentation sections as applicable.
 
 Third-party additions require a current official-source review, an entry in

@@ -8,8 +8,8 @@
 [English](README.md) · [快速开始](docs/getting-started.md) ·
 [为客户部署](docs/deploy-for-client.md) · [开发 Capability Pack](docs/packs/build-your-first-pack.md)
 
-> 当前状态：`v0.1.0-alpha.0` Phase 0。安装器仅实现 `version`、`doctor` 和
-> 不产生变更的 `install --dry-run`，尚不会启动正式服务。
+> 当前状态：`v0.1-bootstrap`。原生 Rust CLI 已支持版本、结构化 doctor/status、
+> runtime 查询命令和无副作用安装计划。
 
 ## 员工未来可以完成
 
@@ -27,18 +27,17 @@
 Community 核心采用 Apache-2.0，允许提供商业实施服务，但必须同时遵守第三方
 组件许可证。详见[许可证说明](docs/licensing.md)。
 
-## Phase 0 开发验证
+## Bootstrap 开发验证
 
 ```bash
-corepack enable
-pnpm install --frozen-lockfile
-pnpm lint
-pnpm typecheck
-pnpm test
-pnpm test:integration
-pnpm build
-node installer/cli/dist/cli.js doctor --json
-node installer/cli/dist/cli.js install --dry-run --json
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo build --release
+./target/release/openwork --version
+./target/release/openwork status --json
+./target/release/openwork doctor --json
+./target/release/openwork install --dry-run --json
 ```
 
-当前安装主机契约仅支持 Linux `amd64`/`arm64`。硬件门槛将在公开 benchmark 后确定。
+平台支持证据见 [platform-support.md](docs/platform-support.md)，fixture、CI 烟测和真机验证不会混为一谈。

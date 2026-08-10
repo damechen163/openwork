@@ -1,16 +1,21 @@
 # Getting started
 
-Phase 0 is a developer preview and does not install services yet.
+The Bootstrap Runtime is a native developer preview. It does not install the
+broader OpenWork service stack.
 
 ## Developer requirements
 
-- Node.js 24 LTS-compatible runtime
-- Corepack and pnpm 10.21.0
-- Docker Engine and Docker Compose for diagnostics
+- Rust 1.85 or newer for source builds
+- Git for source checkout and selected runtime workflows
+- Docker is optional and reported as `SKIP` when absent
 
-Run the commands in the root README. On Linux `amd64` or `arm64`, `doctor` validates the
-current host contract. On other operating systems it intentionally reports a blocked
-installation while remaining usable for development and tests.
+```bash
+cargo test --workspace
+cargo run -p openwork-cli -- --version
+cargo run -p openwork-cli -- status
+cargo run -p openwork-cli -- doctor --json
+cargo run -p openwork-cli -- install --dry-run --json
+```
 
-Never put provider keys on a command line. The mutating installer will introduce a
-permission-restricted secret file in Issue #5.
+Dry-run does not create directories, download files, or execute subprocesses.
+Never put provider keys on a command line or in the runtime lockfile.
