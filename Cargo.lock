@@ -277,6 +277,10 @@ dependencies = [
 [[package]]
 name = "openwork-runtime"
 version = "0.1.0"
+dependencies = [
+ "openwork-core",
+ "serde",
+]
 
 [[package]]
 name = "proc-macro2"
