@@ -1,12 +1,16 @@
 //! Runtime contracts, registry, manifests, and external-managed adapters.
 
 mod manifest;
+mod mock;
 mod registry;
+
+pub mod compatibility;
 
 pub use manifest::{
     InstallerSource, RUNTIME_MANIFEST_SCHEMA_VERSION, RuntimeManifest, VerificationPolicy,
     parse_manifest_json,
 };
+pub use mock::MockRuntime;
 pub use registry::RuntimeRegistry;
 
 use openwork_core::OpenWorkError;
