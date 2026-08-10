@@ -1,8 +1,14 @@
 //! Transactional execution persistence boundary and deterministic memory store.
 
+use crate::approval::{ActionClaim, ApprovalConsumption, ApprovalRepository};
 use crate::audit::AuditAppend;
-use crate::{Artifact, AuditEvent, AuditEventType, Run, RunId, RunStatus};
+use crate::{
+    ActionId, ActionRequest, ActorId, ApprovalDecision, ApprovalDecisionRecord, ApprovalId,
+    ApprovalRequest, ApprovalStatus, Artifact, AuditEvent, AuditEventId, AuditEventType,
+    RedactedAuditMetadata, Run, RunId, RunStatus, UtcTimestamp,
+};
 use openwork_core::{ErrorCode, OpenWorkError, redact_text};
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -80,6 +86,8 @@ struct State {
     runs: BTreeMap<RunId, Run>,
     audits: BTreeMap<RunId, Vec<AuditEvent>>,
     artifacts: BTreeMap<RunId, Vec<Artifact>>,
+    approvals: BTreeMap<ApprovalId, ApprovalRequest>,
+    action_claims: BTreeMap<ActionId, ActionClaim>,
 }
 
 impl ExecutionStore for InMemoryExecutionStore {
@@ -295,6 +303,289 @@ impl InMemoryExecutionStore {
             .lock()
             .map_err(|_| internal_error("execution store lock poisoned"))
     }
+}
+
+impl ApprovalRepository for InMemoryExecutionStore {
+    fn create_approval(
+        &self,
+        mut request: ApprovalRequest,
+        trusted_actor: ActorId,
+        trusted_now: UtcTimestamp,
+    ) -> Result<ApprovalRequest, OpenWorkError> {
+        if request.status != ApprovalStatus::Pending
+            || request.revision != 0
+            || request.requested_by != trusted_actor
+            || request.created_at != trusted_now
+            || request.request_reason.len() > 2048
+        {
+            return Err(approval_error("new approval invariants are invalid"));
+        }
+        request.request_reason = redact_text(&request.request_reason);
+        request.validate()?;
+
+        let mut state = self.lock()?;
+        if !state.runs.contains_key(&request.run_id) {
+            return Err(approval_error("approval run does not exist"));
+        }
+        if state.approvals.contains_key(&request.id)
+            || state.approvals.values().any(|stored| {
+                stored.run_id == request.run_id
+                    && stored.action_id == request.action_id
+                    && stored.parameter_hash == request.parameter_hash
+                    && matches!(
+                        stored.status,
+                        ApprovalStatus::Pending | ApprovalStatus::Approved
+                    )
+            })
+        {
+            return Err(approval_error("approval already exists"));
+        }
+        let event = approval_event(
+            &state,
+            &request,
+            AuditEventType::ApprovalRequested,
+            trusted_actor,
+            trusted_now,
+        )?;
+        let State {
+            approvals, audits, ..
+        } = &mut *state;
+        let events = audits.get_mut(&request.run_id).ok_or_else(audit_missing)?;
+        approvals.insert(request.id.clone(), request.clone());
+        events.push(event);
+        Ok(request)
+    }
+
+    fn decide_approval(
+        &self,
+        approval_id: &ApprovalId,
+        expected_revision: u64,
+        decision: ApprovalDecision,
+        trusted_actor: ActorId,
+        reason: Option<&str>,
+        trusted_now: UtcTimestamp,
+    ) -> Result<ApprovalRequest, OpenWorkError> {
+        if reason.is_some_and(|value| value.len() > 2048) {
+            return Err(approval_error("approval decision reason is too long"));
+        }
+        let mut state = self.lock()?;
+        let current = state
+            .approvals
+            .get(approval_id)
+            .ok_or_else(approval_missing)?
+            .clone();
+        if current.status != ApprovalStatus::Pending
+            || current.revision != expected_revision
+            || current.is_expired_at(trusted_now)
+        {
+            return Err(approval_error(
+                "approval is expired, stale, or no longer pending",
+            ));
+        }
+        let status = match decision {
+            ApprovalDecision::Approved => ApprovalStatus::Approved,
+            ApprovalDecision::Denied => ApprovalStatus::Denied,
+        };
+        let mut updated = current;
+        updated.status = status;
+        updated.revision = next_revision(updated.revision)?;
+        updated.decision = Some(ApprovalDecisionRecord {
+            decision,
+            actor: trusted_actor.clone(),
+            reason: reason.map(redact_text),
+            decided_at: trusted_now,
+        });
+        updated.validate()?;
+        let event_type = match decision {
+            ApprovalDecision::Approved => AuditEventType::ApprovalApproved,
+            ApprovalDecision::Denied => AuditEventType::ApprovalDenied,
+        };
+        let event = approval_event(&state, &updated, event_type, trusted_actor, trusted_now)?;
+        commit_approval(&mut state, &updated, event)?;
+        Ok(updated)
+    }
+
+    fn expire_approval(
+        &self,
+        approval_id: &ApprovalId,
+        expected_revision: u64,
+        trusted_actor: ActorId,
+        trusted_now: UtcTimestamp,
+    ) -> Result<ApprovalRequest, OpenWorkError> {
+        let mut state = self.lock()?;
+        let mut updated = state
+            .approvals
+            .get(approval_id)
+            .ok_or_else(approval_missing)?
+            .clone();
+        if !matches!(
+            updated.status,
+            ApprovalStatus::Pending | ApprovalStatus::Approved
+        ) || updated.revision != expected_revision
+            || !updated.is_expired_at(trusted_now)
+        {
+            return Err(approval_error(
+                "approval cannot expire at this revision and time",
+            ));
+        }
+        updated.status = ApprovalStatus::Expired;
+        updated.revision = next_revision(updated.revision)?;
+        updated.validate()?;
+        let event = approval_event(
+            &state,
+            &updated,
+            AuditEventType::ApprovalDenied,
+            trusted_actor,
+            trusted_now,
+        )?;
+        commit_approval(&mut state, &updated, event)?;
+        Ok(updated)
+    }
+
+    fn consume_approval(
+        &self,
+        approval_id: &ApprovalId,
+        expected_revision: u64,
+        action: &ActionRequest,
+        trusted_actor: ActorId,
+        trusted_now: UtcTimestamp,
+    ) -> Result<ApprovalConsumption, OpenWorkError> {
+        let mut state = self.lock()?;
+        let current = state
+            .approvals
+            .get(approval_id)
+            .ok_or_else(approval_missing)?
+            .clone();
+        if current.status == ApprovalStatus::Approved
+            && current.revision == expected_revision
+            && !current.is_expired_at(trusted_now)
+            && !current.binding_matches(action)
+        {
+            let event = approval_event(
+                &state,
+                &current,
+                AuditEventType::ApprovalBindingMismatch,
+                trusted_actor,
+                trusted_now,
+            )?;
+            state
+                .audits
+                .get_mut(&current.run_id)
+                .ok_or_else(audit_missing)?
+                .push(event);
+            return Err(approval_error("approval binding does not match action"));
+        }
+        current.can_consume_at(action, expected_revision, trusted_now)?;
+        if state.action_claims.contains_key(&action.id) {
+            return Err(approval_error("action was already claimed"));
+        }
+        let mut updated = current;
+        updated.status = ApprovalStatus::Consumed;
+        updated.revision = next_revision(updated.revision)?;
+        updated.consumed_at = Some(trusted_now);
+        updated.validate()?;
+        let claim = ActionClaim {
+            run_id: action.run_id.clone(),
+            action_id: action.id.clone(),
+            parameter_hash: action.parameter_hash().clone(),
+            actor: trusted_actor.clone(),
+            claimed_at: trusted_now,
+        };
+        let event = approval_event(
+            &state,
+            &updated,
+            AuditEventType::ApprovalApproved,
+            trusted_actor,
+            trusted_now,
+        )?;
+        commit_approval(&mut state, &updated, event)?;
+        state
+            .action_claims
+            .insert(claim.action_id.clone(), claim.clone());
+        Ok(ApprovalConsumption {
+            approval: updated,
+            action_claim: claim,
+        })
+    }
+
+    fn get_approval(
+        &self,
+        approval_id: &ApprovalId,
+    ) -> Result<Option<ApprovalRequest>, OpenWorkError> {
+        Ok(self.lock()?.approvals.get(approval_id).cloned())
+    }
+
+    fn get_action_claim(&self, action_id: &ActionId) -> Result<Option<ActionClaim>, OpenWorkError> {
+        Ok(self.lock()?.action_claims.get(action_id).cloned())
+    }
+}
+
+fn approval_event(
+    state: &State,
+    approval: &ApprovalRequest,
+    event_type: AuditEventType,
+    actor: ActorId,
+    timestamp: UtcTimestamp,
+) -> Result<AuditEvent, OpenWorkError> {
+    let events = state
+        .audits
+        .get(&approval.run_id)
+        .ok_or_else(audit_missing)?;
+    if events
+        .last()
+        .is_some_and(|event| timestamp < event.timestamp)
+    {
+        return Err(approval_error("approval audit timestamp moved backwards"));
+    }
+    let sequence = u64::try_from(events.len())
+        .map_err(|_| internal_error("audit sequence overflow"))?
+        .checked_add(1)
+        .ok_or_else(|| internal_error("audit sequence overflow"))?;
+    let metadata = BTreeMap::from([
+        ("approval_id".to_owned(), json!(&approval.id)),
+        ("action_id".to_owned(), json!(&approval.action_id)),
+        ("parameter_hash".to_owned(), json!(&approval.parameter_hash)),
+        ("revision".to_owned(), json!(approval.revision)),
+        ("status".to_owned(), json!(approval.status)),
+    ]);
+    AuditEvent::new(
+        AuditEventId::generate(),
+        approval.run_id.clone(),
+        sequence,
+        event_type,
+        actor,
+        timestamp,
+        RedactedAuditMetadata::from_untrusted(&metadata),
+        events.last().map(|event| event.event_hash().clone()),
+    )
+}
+
+fn commit_approval(
+    state: &mut State,
+    approval: &ApprovalRequest,
+    event: AuditEvent,
+) -> Result<(), OpenWorkError> {
+    let State {
+        approvals, audits, ..
+    } = state;
+    let events = audits.get_mut(&approval.run_id).ok_or_else(audit_missing)?;
+    approvals.insert(approval.id.clone(), approval.clone());
+    events.push(event);
+    Ok(())
+}
+
+fn next_revision(revision: u64) -> Result<u64, OpenWorkError> {
+    revision
+        .checked_add(1)
+        .ok_or_else(|| approval_error("approval revision overflow"))
+}
+
+fn approval_missing() -> OpenWorkError {
+    approval_error("approval does not exist")
+}
+
+fn approval_error(message: &str) -> OpenWorkError {
+    OpenWorkError::new(ErrorCode::ApprovalInvalid, message)
 }
 
 fn validate_new_run(run: &Run) -> Result<(), OpenWorkError> {
