@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "metadata": {
+    "id": "mock",
+    "name": "OpenWork Mock Runtime",
+    "upstream": "https://github.com/shichenghaoshu/openwork",
+    "license": "Apache-2.0",
+    "distribution": "embedded"
+  },
+  "capabilities": {
+    "install": true,
+    "uninstall": true,
+    "update": true,
+    "authenticate": true,
+    "run": true,
+    "cancel": true
+  },
+  "installer_sources": [
+    {
+      "os": "fixture",
+      "architecture": "fixture",
+      "environment": "test",
+      "url": "https://example.invalid/openwork/mock",
+      "verification": "observed_checksum"
+    }
+  ]
+}
