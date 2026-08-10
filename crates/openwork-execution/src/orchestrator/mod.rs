@@ -101,11 +101,8 @@ impl<S: ExecutionStore> ExecutionOrchestrator<S> {
         created_at: UtcTimestamp,
     ) -> Result<Vec<Artifact>, OpenWorkError> {
         let artifacts = self.scanner.scan(run_id, output_root, paths, created_at)?;
-        self.store.record_artifacts(
-            run_id,
-            artifacts.clone(),
-            audit(actor, created_at),
-        )?;
+        self.store
+            .record_artifacts(run_id, artifacts.clone(), audit(actor, created_at))?;
         Ok(artifacts)
     }
 

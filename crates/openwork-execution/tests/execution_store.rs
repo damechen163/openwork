@@ -69,7 +69,11 @@ fn persistence_rechecks_public_contract_fields() {
     };
     assert!(
         store
-            .record_artifacts(&run.id, vec![invalid_artifact])
+            .record_artifacts(
+                &run.id,
+                vec![invalid_artifact],
+                audit("2026-08-10T00:00:01Z"),
+            )
             .is_err()
     );
     assert!(store.artifacts(&run.id).expect("artifacts").is_empty());

@@ -130,6 +130,7 @@ impl ExecutionStore for InMemoryExecutionStore {
             .checked_add(1)
             .ok_or_else(|| internal_error("audit sequence overflow"))?;
         let previous = events.last().map(|event| event.event_hash().clone());
+        let audit_timestamp = audit.timestamp;
         let event = audit.with_run_status(next).build(
             run_id.clone(),
             sequence,
@@ -143,12 +144,12 @@ impl ExecutionStore for InMemoryExecutionStore {
             .revision
             .checked_add(1)
             .ok_or_else(|| state_error("run revision overflow"))?;
-        updated.updated_at = audit.timestamp;
+        updated.updated_at = audit_timestamp;
         if next == RunStatus::Running && updated.started_at.is_none() {
-            updated.started_at = Some(audit.timestamp);
+            updated.started_at = Some(audit_timestamp);
         }
         if next.is_terminal() {
-            updated.completed_at = Some(audit.timestamp);
+            updated.completed_at = Some(audit_timestamp);
             updated.terminal_reason = (next != RunStatus::Succeeded)
                 .then(|| reason.map_or_else(|| "unspecified".to_owned(), redact_text));
         }
