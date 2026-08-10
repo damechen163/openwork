@@ -200,6 +200,15 @@ impl ExecutionStore for InMemoryExecutionStore {
                 "artifact run mismatch",
             ));
         }
+        if artifacts
+            .iter()
+            .any(|artifact| artifact.media_type.trim().is_empty())
+        {
+            return Err(OpenWorkError::new(
+                ErrorCode::ArtifactInvalid,
+                "artifact media type is empty",
+            ));
+        }
         let existing = state.artifacts.entry(run_id.clone()).or_default();
         if artifacts.iter().any(|candidate| {
             existing.iter().any(|stored| stored.path == candidate.path)
@@ -248,6 +257,7 @@ fn validate_new_run(run: &Run) -> Result<(), OpenWorkError> {
     if run.status != RunStatus::Queued
         || run.revision != 0
         || run.runtime.trim().is_empty()
+        || run.runtime.len() > 128
         || run.workspace.as_os_str().is_empty()
         || run.updated_at != run.created_at
         || run.started_at.is_some()

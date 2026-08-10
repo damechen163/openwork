@@ -5,18 +5,22 @@ use crate::{
     UtcTimestamp,
 };
 use openwork_core::OpenWorkError;
-use serde_json::Value;
 use std::collections::BTreeMap;
 
-/// Trusted envelope plus untrusted metadata for one audit append transaction.
+/// Trusted audit envelope. Event-specific metadata must use typed constructors
+/// instead of accepting arbitrary runtime or tool content.
 #[derive(Clone, Debug)]
 pub struct AuditAppend {
     pub actor: ActorId,
     pub timestamp: UtcTimestamp,
-    pub metadata: BTreeMap<String, Value>,
 }
 
 impl AuditAppend {
+    #[must_use]
+    pub const fn new(actor: ActorId, timestamp: UtcTimestamp) -> Self {
+        Self { actor, timestamp }
+    }
+
     pub(crate) fn build(
         &self,
         run_id: RunId,
@@ -31,7 +35,7 @@ impl AuditAppend {
             event_type,
             self.actor.clone(),
             self.timestamp,
-            RedactedAuditMetadata::from_untrusted(&self.metadata),
+            RedactedAuditMetadata::from_untrusted(&BTreeMap::default()),
             previous_hash,
         )
     }

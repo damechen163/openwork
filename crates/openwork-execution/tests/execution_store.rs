@@ -1,11 +1,9 @@
 use openwork_execution::audit::AuditAppend;
 use openwork_execution::store::{ExecutionStore, InMemoryExecutionStore};
 use openwork_execution::{
-    ActorId, AuditEventType, EXECUTION_SCHEMA_VERSION, Run, RunId, RunStatus, UtcTimestamp,
-    sha256_bytes,
+    ActorId, Artifact, ArtifactId, ArtifactSizeBytes, AuditEventType, EXECUTION_SCHEMA_VERSION,
+    RelativeArtifactPath, Run, RunId, RunStatus, UtcTimestamp, sha256_bytes,
 };
-use serde_json::json;
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 
@@ -30,26 +28,51 @@ fn illegal_transition_is_atomic_and_audit_is_redacted() {
         .append_audit(
             &run.id,
             AuditEventType::RuntimeOutput,
-            AuditAppend {
-                actor: actor(),
-                timestamp: timestamp("2026-08-10T00:00:02Z"),
-                metadata: BTreeMap::from([
-                    ("Authorization".to_owned(), json!("Bearer visible")),
-                    ("safe".to_owned(), json!("kept")),
-                ]),
-            },
+            AuditAppend::new(actor(), timestamp("2026-08-10T00:00:02Z")),
         )
         .expect("append event");
     let encoded = serde_json::to_string(&event).expect("serialize event");
-    assert!(!encoded.contains("visible"));
-    assert!(encoded.contains("[REDACTED]"));
-    assert!(encoded.contains("kept"));
+    assert_eq!(event.metadata.as_map().len(), 0);
+    assert!(!encoded.contains("Authorization"));
 
     let events = store.audit_events(&run.id).expect("read audit");
     events[0].verify_integrity(1, None).expect("genesis");
     events[1]
         .verify_integrity(2, Some(events[0].event_hash()))
         .expect("second event");
+}
+
+#[test]
+fn persistence_rechecks_public_contract_fields() {
+    let store = InMemoryExecutionStore::default();
+    let mut invalid_run = queued_run();
+    invalid_run.runtime = "x".repeat(129);
+    assert!(
+        store
+            .create_run(invalid_run, audit("2026-08-10T00:00:00Z"))
+            .is_err()
+    );
+
+    let run = queued_run();
+    store
+        .create_run(run.clone(), audit("2026-08-10T00:00:00Z"))
+        .expect("create valid run");
+    let invalid_artifact = Artifact {
+        schema_version: EXECUTION_SCHEMA_VERSION,
+        id: ArtifactId::parse("01890f3e-a5f1-7cc2-98c0-5f9c6f5e7a02").expect("UUIDv7"),
+        run_id: run.id.clone(),
+        path: RelativeArtifactPath::parse("report.txt").expect("path"),
+        media_type: String::new(),
+        size_bytes: ArtifactSizeBytes::new(1).expect("size"),
+        sha256: sha256_bytes(b"x"),
+        created_at: timestamp("2026-08-10T00:00:01Z"),
+    };
+    assert!(
+        store
+            .record_artifacts(&run.id, vec![invalid_artifact])
+            .is_err()
+    );
+    assert!(store.artifacts(&run.id).expect("artifacts").is_empty());
 }
 
 #[test]
@@ -133,11 +156,7 @@ fn queued_run() -> Run {
 }
 
 fn audit(value: &str) -> AuditAppend {
-    AuditAppend {
-        actor: actor(),
-        timestamp: timestamp(value),
-        metadata: BTreeMap::new(),
-    }
+    AuditAppend::new(actor(), timestamp(value))
 }
 
 fn actor() -> ActorId {
