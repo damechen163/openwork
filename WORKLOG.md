@@ -23,4 +23,4 @@ This file is updated before each development session ends.
   dependency audit, secret patterns, and the exact Apache license text.
 - GitHub Project remains pending because the authenticated token lacks `project`/`read:project`;
   `.github/PROJECT_SETUP.md` and `scripts/bootstrap-github.sh` contain the exact continuation.
-- First pull request: pending creation after this log is committed.
+- Opened the first pull request: https://github.com/shichenghaoshu/openwork/pull/35
