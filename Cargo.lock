@@ -232,6 +232,7 @@ dependencies = [
  "openwork-doctor",
  "openwork-installer",
  "openwork-platform",
+ "openwork-runtime",
  "serde",
  "serde_json",
  "tempfile",

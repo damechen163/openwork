@@ -79,8 +79,8 @@ mod tests {
 
     #[test]
     fn committed_mock_manifest_matches_contract() {
-        let input = include_str!("../../../runtime/manifests/mock.json");
-        let manifest = parse_manifest_json(input).unwrap();
+        let manifest =
+            parse_manifest_json(include_str!("../../../runtime/manifests/mock.json")).unwrap();
         assert_eq!(manifest.schema_version, 1);
         assert_eq!(manifest.metadata.id, RuntimeId::from("mock"));
         assert_eq!(manifest.metadata.distribution, DistributionModel::Embedded);
@@ -90,6 +90,12 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(schema["properties"]["schema_version"]["const"], 1);
+
+        let claude =
+            parse_manifest_json(include_str!("../../../runtime/manifests/claude-code.json"))
+                .unwrap();
+        assert_eq!(claude.metadata.id, RuntimeId::from("claude-code"));
+        assert_eq!(claude.installer_sources.len(), 2);
     }
 
     #[test]

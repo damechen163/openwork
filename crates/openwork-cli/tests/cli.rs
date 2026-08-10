@@ -42,16 +42,22 @@ fn install_dry_run_has_no_filesystem_side_effects() {
 }
 
 #[test]
-fn runtime_commands_have_stable_empty_and_error_states() {
+fn runtime_commands_expose_registered_and_error_states() {
     let list = openwork()
         .args(["runtime", "list", "--json"])
         .output()
         .unwrap();
     assert!(list.status.success());
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&list.stdout).unwrap(),
-        serde_json::json!([])
-    );
+    let runtimes: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(runtimes[0]["metadata"]["id"], "claude-code");
+
+    let claude = openwork()
+        .args(["runtime", "info", "claude-code", "--json"])
+        .output()
+        .unwrap();
+    assert!(claude.status.success());
+    let summary: serde_json::Value = serde_json::from_slice(&claude.stdout).unwrap();
+    assert_eq!(summary["metadata"]["distribution"], "external_managed");
 
     let info = openwork()
         .args(["runtime", "info", "missing", "--json"])
