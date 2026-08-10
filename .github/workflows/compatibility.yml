@@ -2,6 +2,7 @@ name: Compatibility
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   push:
     branches: [main]
   workflow_dispatch:
@@ -19,6 +20,7 @@ env:
 
 jobs:
   native-unix:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: ${{ matrix.name }} (native)
     strategy:
       fail-fast: false
@@ -61,6 +63,7 @@ jobs:
           test "$(jq -r .schema_version doctor.json)" = "1"
 
   native-windows:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: Windows x64 (native Server 2025 runner)
     runs-on: windows-2025
     steps:
@@ -94,6 +97,7 @@ jobs:
           if ($doctor.schema_version -ne 1) { throw "Unexpected Doctor schema" }
 
   installer-syntax:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: Installer syntax
     runs-on: ubuntu-24.04
     steps:
