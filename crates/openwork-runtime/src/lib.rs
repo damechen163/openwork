@@ -1,11 +1,13 @@
 //! Runtime contracts, registry, manifests, and external-managed adapters.
 
+mod claude;
 mod manifest;
 mod mock;
 mod registry;
 
 pub mod compatibility;
 
+pub use claude::ClaudeRuntime;
 pub use manifest::{
     InstallerSource, RUNTIME_MANIFEST_SCHEMA_VERSION, RuntimeManifest, VerificationPolicy,
     parse_manifest_json,
@@ -105,6 +107,7 @@ pub struct RuntimeDoctorCheck {
 pub struct RuntimeInstallPlan {
     pub source_url: String,
     pub version: Option<String>,
+    pub downloads: Vec<DownloadRequest>,
     pub commands: Vec<CommandSpec>,
     pub warnings: Vec<String>,
 }
@@ -192,6 +195,8 @@ pub struct CommandOutput {
 
 #[allow(clippy::missing_errors_doc)]
 pub trait CommandRunner: Send + Sync {
+    fn find_executable(&self, executable: &str) -> Option<PathBuf>;
+
     fn run(
         &self,
         command: &CommandSpec,
@@ -203,6 +208,10 @@ pub trait CommandRunner: Send + Sync {
 pub struct SystemCommandRunner;
 
 impl CommandRunner for SystemCommandRunner {
+    fn find_executable(&self, executable: &str) -> Option<PathBuf> {
+        executable_on_path(executable)
+    }
+
     fn run(
         &self,
         command: &CommandSpec,
@@ -330,6 +339,23 @@ fn command_error(error: std::io::Error) -> OpenWorkError {
         openwork_core::ErrorCode::Io,
         format!("command execution failed: {error}"),
     )
+}
+
+fn executable_on_path(executable: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let extensions = std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT".to_owned());
+    std::env::split_paths(&path).find_map(|directory| {
+        let direct = directory.join(executable);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        cfg!(windows).then(|| {
+            extensions
+                .split(';')
+                .map(|extension| directory.join(format!("{executable}{extension}")))
+                .find(|candidate| candidate.is_file())
+        })?
+    })
 }
 
 #[cfg(test)]

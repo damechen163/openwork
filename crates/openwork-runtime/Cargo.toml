@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 openwork-core = { path = "../openwork-core" }
+openwork-platform = { path = "../openwork-platform" }
 serde.workspace = true
 serde_json.workspace = true
 

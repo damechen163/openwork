@@ -279,6 +279,7 @@ name = "openwork-runtime"
 version = "0.1.0"
 dependencies = [
  "openwork-core",
+ "openwork-platform",
  "serde",
  "serde_json",
 ]
