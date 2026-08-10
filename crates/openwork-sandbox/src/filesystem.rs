@@ -3,13 +3,17 @@ use openwork_core::{ErrorCode, OpenWorkError};
 use openwork_execution::RelativeArtifactPath;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const MAX_OUTPUT_ENTRIES: u32 = 4096;
+const MAX_OUTPUT_FILES: usize = 1024;
+const MAX_OUTPUT_DEPTH: u16 = 64;
 
+#[derive(Debug)]
 pub(crate) struct OwnedTemporaryDirectory {
     path: PathBuf,
     runtime_path: PathBuf,
@@ -19,17 +23,20 @@ pub(crate) struct OwnedTemporaryDirectory {
 impl OwnedTemporaryDirectory {
     pub(crate) fn create(root: &Path) -> Result<Self, OpenWorkError> {
         validate_mount(root)?;
+        ensure_private_storage_supported()?;
         for _ in 0..32 {
             let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let path = root.join(format!("openwork-{}-{sequence}", std::process::id()));
-            match fs::create_dir(&path) {
+            match create_private_directory(&path) {
                 Ok(()) => {
-                    set_private_permissions(&path)?;
                     let runtime_path = path.join("runtime");
-                    fs::create_dir(&runtime_path).map_err(|_| {
-                        sandbox_error(ErrorCode::Io, "runtime temporary directory creation failed")
-                    })?;
-                    set_runtime_permissions(&runtime_path)?;
+                    if create_runtime_directory(&runtime_path).is_err() {
+                        let _ = fs::remove_dir_all(&path);
+                        return Err(sandbox_error(
+                            ErrorCode::Io,
+                            "runtime temporary directory creation failed",
+                        ));
+                    }
                     return Ok(Self {
                         path,
                         runtime_path,
@@ -64,12 +71,8 @@ impl OwnedTemporaryDirectory {
         environment: &BTreeMap<String, String>,
     ) -> Result<PathBuf, OpenWorkError> {
         let path = self.path.join("container.env");
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
+        let mut file = create_private_file(&path)
             .map_err(|_| sandbox_error(ErrorCode::Io, "container environment file failed"))?;
-        set_file_permissions(&path)?;
         for (key, value) in environment {
             if value.contains(['\r', '\n']) {
                 return Err(sandbox_error(
@@ -147,14 +150,17 @@ pub(crate) fn validate_mount(path: &Path) -> Result<(), OpenWorkError> {
 pub(crate) fn collect_output_paths(
     root: &Path,
 ) -> Result<Vec<RelativeArtifactPath>, OpenWorkError> {
-    fn visit(
-        root: &Path,
-        directory: &Path,
-        output: &mut Vec<RelativeArtifactPath>,
-    ) -> Result<(), OpenWorkError> {
+    let mut output = Vec::new();
+    let mut directories = vec![(root.to_path_buf(), 0_u16)];
+    let mut entries_seen = 0_u32;
+    while let Some((directory, depth)) = directories.pop() {
         for entry in
             fs::read_dir(directory).map_err(|_| artifact_error("output cannot be scanned"))?
         {
+            entries_seen = entries_seen.saturating_add(1);
+            if entries_seen > MAX_OUTPUT_ENTRIES {
+                return Err(artifact_error("sandbox output tree is too large"));
+            }
             let entry = entry.map_err(|_| artifact_error("output entry is invalid"))?;
             let path = entry.path();
             let metadata = fs::symlink_metadata(&path)
@@ -163,9 +169,13 @@ pub(crate) fn collect_output_paths(
                 return Err(artifact_error("output contains a symlink or special file"));
             }
             if metadata.is_dir() {
-                visit(root, &path, output)?;
+                let child_depth = depth.saturating_add(1);
+                if child_depth > MAX_OUTPUT_DEPTH {
+                    return Err(artifact_error("sandbox output tree is too deep"));
+                }
+                directories.push((path, child_depth));
             } else {
-                if output.len() >= 1024 {
+                if output.len() >= MAX_OUTPUT_FILES {
                     return Err(artifact_error("sandbox produced too many files"));
                 }
                 let relative = path
@@ -178,10 +188,7 @@ pub(crate) fn collect_output_paths(
                 output.push(RelativeArtifactPath::parse(portable)?);
             }
         }
-        Ok(())
     }
-    let mut output = Vec::new();
-    visit(root, root, &mut output)?;
     output.sort();
     Ok(output)
 }
@@ -206,38 +213,141 @@ fn artifact_error(message: &'static str) -> OpenWorkError {
     sandbox_error(ErrorCode::ArtifactInvalid, message)
 }
 
+fn ensure_private_storage_supported() -> Result<(), OpenWorkError> {
+    if cfg!(unix) {
+        Ok(())
+    } else {
+        Err(sandbox_error(
+            ErrorCode::SandboxUnavailable,
+            "secure sandbox temporary storage is unavailable on this platform",
+        ))
+    }
+}
+
 #[cfg(unix)]
-fn set_private_permissions(path: &Path) -> Result<(), OpenWorkError> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .map_err(|_| sandbox_error(ErrorCode::Io, "temporary permissions failed"))
+fn create_private_directory(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    fs::DirBuilder::new().mode(0o700).create(path)
 }
 
 #[cfg(not(unix))]
-fn set_private_permissions(_path: &Path) -> Result<(), OpenWorkError> {
-    Ok(())
+fn create_private_directory(_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "owner-only directory creation is unsupported",
+    ))
 }
 
 #[cfg(unix)]
-fn set_runtime_permissions(path: &Path) -> Result<(), OpenWorkError> {
+fn create_runtime_directory(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::fs::PermissionsExt;
+
+    fs::DirBuilder::new().mode(0o777).create(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o777))
-        .map_err(|_| sandbox_error(ErrorCode::Io, "runtime permissions failed"))
 }
 
 #[cfg(not(unix))]
-fn set_runtime_permissions(_path: &Path) -> Result<(), OpenWorkError> {
-    Ok(())
+fn create_runtime_directory(_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "runtime directory creation is unsupported",
+    ))
 }
 
 #[cfg(unix)]
-fn set_file_permissions(path: &Path) -> Result<(), OpenWorkError> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .map_err(|_| sandbox_error(ErrorCode::Io, "environment permissions failed"))
+fn create_private_file(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
 }
 
 #[cfg(not(unix))]
-fn set_file_permissions(_path: &Path) -> Result<(), OpenWorkError> {
-    Ok(())
+fn create_private_file(_path: &Path) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "owner-only file creation is unsupported",
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MAX_OUTPUT_DEPTH, MAX_OUTPUT_ENTRIES, OwnedTemporaryDirectory, collect_output_paths,
+    };
+    use openwork_core::ErrorCode;
+    use std::fs;
+
+    #[test]
+    fn output_scan_bounds_combined_files_and_directories() {
+        let root = tempfile::tempdir().expect("temporary output root");
+        for index in 0..MAX_OUTPUT_ENTRIES {
+            fs::create_dir(root.path().join(format!("empty-{index}")))
+                .expect("empty output directory");
+        }
+        fs::write(root.path().join("one-more-entry"), b"output").expect("output file");
+
+        let error = collect_output_paths(root.path()).expect_err("entry limit must be enforced");
+
+        assert_eq!(error.code, ErrorCode::ArtifactInvalid);
+        assert!(error.message.contains("too large"));
+    }
+
+    #[test]
+    fn output_scan_rejects_excessive_depth_without_recursion() {
+        let root = tempfile::tempdir().expect("temporary output root");
+        let mut directory = root.path().to_path_buf();
+        for _ in 0..=MAX_OUTPUT_DEPTH {
+            directory = directory.join("d");
+            fs::create_dir(&directory).expect("nested output directory");
+        }
+
+        let error = collect_output_paths(root.path()).expect_err("depth limit must be enforced");
+
+        assert_eq!(error.code, ErrorCode::ArtifactInvalid);
+        assert!(error.message.contains("too deep"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_storage_is_private_at_creation() {
+        use std::collections::BTreeMap;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temporary backend root");
+        let temporary = OwnedTemporaryDirectory::create(root.path()).expect("private temporary");
+        let environment = temporary
+            .write_environment(&BTreeMap::from([("LANG".to_owned(), "C".to_owned())]))
+            .expect("private environment file");
+
+        let directory_mode = fs::metadata(environment.parent().expect("temporary directory"))
+            .expect("temporary metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let file_mode = fs::metadata(environment)
+            .expect("environment metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(directory_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn temporary_storage_fails_closed_before_creating_data() {
+        let root = tempfile::tempdir().expect("temporary backend root");
+
+        let error = OwnedTemporaryDirectory::create(root.path())
+            .expect_err("platform without owner-only ACL support must fail");
+
+        assert_eq!(error.code, ErrorCode::SandboxUnavailable);
+        assert_eq!(fs::read_dir(root.path()).expect("backend root").count(), 0);
+    }
 }
