@@ -23,7 +23,7 @@ env:
 jobs:
   native-unix:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    name: ${{ matrix.name }} (native)
+    name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: native-unix' || format('{0} (native)', matrix.name) }}"
     strategy:
       fail-fast: false
       matrix:
@@ -66,7 +66,7 @@ jobs:
 
   native-windows:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    name: Windows x64 (native Server 2025 runner)
+    name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: native-windows' || 'Windows x64 (native Server 2025 runner)' }}"
     runs-on: windows-2025
     steps:
       - name: Check out source
@@ -100,7 +100,7 @@ jobs:
 
   installer-syntax:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    name: Installer syntax
+    name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: installer-syntax' || 'Installer syntax' }}"
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source

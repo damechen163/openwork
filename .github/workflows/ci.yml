@@ -17,6 +17,7 @@ concurrency:
 
 jobs:
   lint:
+    name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: lint' || 'lint' }}"
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
@@ -25,6 +26,7 @@ jobs:
       - run: cargo fmt --all --check
 
   typecheck:
+    name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: typecheck' || 'typecheck' }}"
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
@@ -32,6 +34,7 @@ jobs:
       - run: cargo check --workspace --all-targets --locked
 
   unit:
+    name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: unit' || 'unit' }}"
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
@@ -39,6 +42,7 @@ jobs:
       - run: cargo test --workspace --lib --locked
 
   integration:
+    name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: integration' || 'integration' }}"
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
@@ -46,6 +50,7 @@ jobs:
       - run: cargo test --workspace --tests --locked
 
   build:
+    name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: build' || 'build' }}"
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
@@ -54,6 +59,7 @@ jobs:
       - run: test "$(target/release/openwork --version)" = "OpenWork 0.1.0"
 
   clippy:
+    name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: clippy' || 'clippy' }}"
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
@@ -62,6 +68,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   compose-smoke:
+    name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: compose-smoke' || 'compose-smoke' }}"
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
@@ -69,6 +76,7 @@ jobs:
       - run: test ! -f installer/compose/compose.test.yml
 
   pack-validation:
+    name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: pack-validation' || 'pack-validation' }}"
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
@@ -76,6 +84,7 @@ jobs:
       - run: test ! -e contracts/schemas/capability-pack.v1.schema.json
 
   license-check:
+    name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: license-check' || 'license-check' }}"
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
@@ -85,6 +94,7 @@ jobs:
       - run: '! jq -e ''.packages[] | select(.license == null)'' /tmp/openwork-cargo-metadata.json'
 
   sbom:
+    name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: sbom' || 'sbom' }}"
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
@@ -93,6 +103,7 @@ jobs:
       - run: test -s /tmp/openwork-cargo-sbom-input.json
 
   secret-scan:
+    name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: secret-scan' || 'secret-scan' }}"
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
@@ -101,6 +112,7 @@ jobs:
         run: '! git grep -nE "(sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY)"'
 
   codeql-or-sast:
+    name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: codeql-or-sast' || 'codeql-or-sast' }}"
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
@@ -109,6 +121,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   container-scan:
+    name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: container-scan' || 'container-scan' }}"
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
@@ -116,6 +129,7 @@ jobs:
       - run: test -z "$(find . -path './target' -prune -o -name Dockerfile -print -quit)"
 
   docs-links:
+    name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: docs-links' || 'docs-links' }}"
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
