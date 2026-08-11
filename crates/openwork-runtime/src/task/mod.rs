@@ -8,8 +8,9 @@ pub use codex::{CODEX_REQUIRED_FLAGS, CODEX_RUNTIME_ID, CodexTaskAdapter, CodexT
 
 use openwork_core::{ErrorCode, OpenWorkError, redact_json, redact_text};
 use openwork_execution::{
-    EXECUTION_SCHEMA_VERSION, RedactedAuditMetadata, RunId, RuntimeEvent, RuntimeEventPayload,
-    RuntimeTask, SandboxCommand, SandboxWorkingDirectory, UtcTimestamp,
+    EXECUTION_SCHEMA_VERSION, ApprovedMountDirectory, DigestPinnedImageRef, RedactedAuditMetadata,
+    RunId, RuntimeEvent, RuntimeEventPayload, RuntimeTask, SandboxCommand, SandboxLimits,
+    SandboxNetworkPolicy, SandboxRequest, SandboxUser, SandboxWorkingDirectory, UtcTimestamp,
 };
 use serde::Deserializer;
 use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
@@ -43,6 +44,45 @@ pub struct RuntimeInvocation {
     pub working_directory: SandboxWorkingDirectory,
     pub stdin: Vec<u8>,
     pub output_protocol: RuntimeOutputProtocol,
+}
+
+/// Converts a prepared provider invocation into a bounded sandbox execution request.
+///
+/// The runtime adapter's stdin takes precedence over any existing `SandboxCommand` stdin.
+/// All other parameters (image, user, mounts, limits) come from the execution environment.
+///
+/// # Errors
+///
+/// Returns an error for invalid mount directories, resource limits, or duplicate paths.
+pub fn into_sandbox_request(
+    invocation: RuntimeInvocation,
+    run_id: RunId,
+    image: DigestPinnedImageRef,
+    user: SandboxUser,
+    input_directory: ApprovedMountDirectory,
+    output_directory: ApprovedMountDirectory,
+    limits: SandboxLimits,
+) -> Result<SandboxRequest, OpenWorkError> {
+    let mut command = invocation.command;
+    if !invocation.stdin.is_empty() {
+        // Rebuild the command with the adapter-supplied stdin, replacing any
+        // default empty stdin from the adapter constructor.
+        command = SandboxCommand::with_stdin(
+            command.program().to_owned(),
+            command.arguments().to_vec(),
+            command.environment().clone(),
+            invocation.stdin,
+        )?;
+    }
+    SandboxRequest::new(
+        run_id,
+        image,
+        command,
+        user,
+        input_directory,
+        output_directory,
+        limits,
+    )
 }
 
 /// Provider-specific preparation that never executes a process on the host.
