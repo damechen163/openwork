@@ -25,6 +25,7 @@ pub const MAX_ACTION_PARAMETER_BYTES: usize = 64 * 1024;
 pub const MAX_ACTION_PARAMETER_DEPTH: usize = 32;
 pub const MAX_APPROVAL_TTL_SECONDS: i128 = 24 * 60 * 60;
 pub const MAX_SANDBOX_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_SANDBOX_STDIN_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SchemaVersion;
@@ -635,6 +636,7 @@ pub struct SandboxCommand {
     program: String,
     arguments: Vec<String>,
     environment: BTreeMap<String, String>,
+    stdin: Vec<u8>,
 }
 
 impl SandboxCommand {
@@ -643,6 +645,20 @@ impl SandboxCommand {
         program: impl Into<String>,
         arguments: Vec<String>,
         environment: BTreeMap<String, String>,
+    ) -> Result<Self, OpenWorkError> {
+        Self::with_stdin(program, arguments, environment, Vec::new())
+    }
+
+    /// Creates a command with optional stdin bytes for the container process.
+    ///
+    /// Stdin is bounded at 1 MiB to prevent unbounded prompt injection through
+    /// the sandbox boundary. Most provider prompts fit well within this limit.
+    #[allow(clippy::missing_errors_doc)]
+    pub fn with_stdin(
+        program: impl Into<String>,
+        arguments: Vec<String>,
+        environment: BTreeMap<String, String>,
+        stdin: Vec<u8>,
     ) -> Result<Self, OpenWorkError> {
         let program = program.into();
         let valid_program = program.starts_with('/')
@@ -660,15 +676,17 @@ impl SandboxCommand {
             && environment.iter().all(|(key, value)| {
                 valid_environment_name(key) && value.len() <= 8192 && !value.contains('\0')
             });
-        if !valid_program || !arguments_valid || !environment_valid {
+        let stdin_valid = stdin.len() <= MAX_SANDBOX_STDIN_BYTES;
+        if !valid_program || !arguments_valid || !environment_valid || !stdin_valid {
             return Err(invalid_contract(
-                "sandbox command must use an absolute program and bounded argv/environment allowlist",
+                "sandbox command must use an absolute program and bounded argv/environment/stdin allowlist",
             ));
         }
         Ok(Self {
             program,
             arguments,
             environment,
+            stdin,
         })
     }
 
@@ -686,6 +704,11 @@ impl SandboxCommand {
     pub const fn environment(&self) -> &BTreeMap<String, String> {
         &self.environment
     }
+
+    #[must_use]
+    pub fn stdin(&self) -> &[u8] {
+        &self.stdin
+    }
 }
 
 #[derive(Deserialize)]
@@ -694,6 +717,8 @@ struct SandboxCommandWire {
     program: String,
     arguments: Vec<String>,
     environment: BTreeMap<String, String>,
+    #[serde(default)]
+    stdin: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for SandboxCommand {
@@ -702,7 +727,9 @@ impl<'de> Deserialize<'de> for SandboxCommand {
         D: Deserializer<'de>,
     {
         let wire = SandboxCommandWire::deserialize(deserializer)?;
-        Self::new(wire.program, wire.arguments, wire.environment).map_err(serde::de::Error::custom)
+        let stdin = wire.stdin.map_or_else(Vec::new, |s| s.into_bytes());
+        Self::with_stdin(wire.program, wire.arguments, wire.environment, stdin)
+            .map_err(serde::de::Error::custom)
     }
 }
 
