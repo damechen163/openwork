@@ -351,15 +351,16 @@ fn full_execution_pipeline_sales_analysis_vertical_slice() {
         .audit_events(&run.id)
         .expect("read audit events");
 
-    // Expected event sequence:
+    // Expected event sequence (includes the manual Planning transition):
     //   1. RunCreated        (from create_run)
-    //   2. RuntimeStarted    (Queued -> Running)
-    //   3. ArtifactCreated   (first artifact)
-    //   4. ArtifactCreated   (second artifact)
-    //   5. RunCompleted      (Running -> Succeeded)
+    //   2. RuntimeSelected   (Queued -> Planning, manually)
+    //   3. RuntimeStarted    (Planning -> Running, first execute step)
+    //   4. ArtifactCreated   (first artifact)
+    //   5. ArtifactCreated   (second artifact)
+    //   6. RunCompleted      (Running -> Succeeded)
     assert!(
-        events.len() >= 5,
-        "at least five audit events (timestamps may add extra events)"
+        events.len() >= 6,
+        "at least six audit events (planning transition adds an event)"
     );
 
     // Verify chain integrity: each event must reference the previous hash.
@@ -669,8 +670,8 @@ fn pipeline_sandbox_failure_records_failed_state() {
 
     assert!(result.is_err(), "orchestrator must propagate sandbox failure");
 
-    // The run should have been transitioned to Running then Failed by the
-    // orchestrator's error handler.
+    // The orchestrator's error handler records a best-effort transition to
+    // Failed so the run is terminal even when the sandbox fails.
     let stored_run = orchestrator
         .store()
         .get_run(&run.id)
