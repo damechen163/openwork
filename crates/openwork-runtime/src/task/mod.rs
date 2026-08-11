@@ -9,8 +9,7 @@ pub use codex::{CODEX_REQUIRED_FLAGS, CODEX_RUNTIME_ID, CodexTaskAdapter, CodexT
 use openwork_core::{ErrorCode, OpenWorkError, redact_json, redact_text};
 use openwork_execution::{
     EXECUTION_SCHEMA_VERSION, ApprovedMountDirectory, DigestPinnedImageRef, RedactedAuditMetadata,
-    RunId, RuntimeEvent, RuntimeEventPayload, RuntimeTask, SandboxCommand, SandboxLimits,
-    SandboxNetworkPolicy, SandboxRequest, SandboxUser, SandboxWorkingDirectory, UtcTimestamp,
+    RunId, RuntimeEvent, RuntimeEventPayload, RuntimeTask, SandboxCommand, SandboxLimits, SandboxRequest, SandboxUser, SandboxWorkingDirectory, UtcTimestamp,
 };
 use serde::Deserializer;
 use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};

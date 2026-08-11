@@ -5,7 +5,7 @@ use crate::audit::AuditAppend;
 use crate::store::ExecutionStore;
 use crate::{
     ActorId, Artifact, EXECUTION_SCHEMA_VERSION, RelativeArtifactPath, Run, RunId, RunStatus,
-    UtcTimestamp, sha256_bytes,
+    SandboxBackend, SandboxRequest, UtcTimestamp, sha256_bytes,
 };
 use openwork_core::{ErrorCode, OpenWorkError};
 use std::fs;
@@ -104,6 +104,115 @@ impl<S: ExecutionStore> ExecutionOrchestrator<S> {
         self.store
             .record_artifacts(run_id, artifacts.clone(), audit(actor, created_at))?;
         Ok(artifacts)
+    }
+
+    /// Executes a prepared sandbox request within the run lifecycle.
+    ///
+    /// Transitions the run to Running, delegates to the sandbox backend,
+    /// scans validated output artifacts, and records the terminal status
+    /// with full audit trail. This is the primary execution path for M1.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a stale run revision, illegal transition,
+    /// sandbox failure, invalid output, or persistence failure.
+    pub fn execute(
+        &self,
+        run: &Run,
+        sandbox: &dyn SandboxBackend,
+        request: &SandboxRequest,
+        actor: ActorId,
+        now: UtcTimestamp,
+    ) -> Result<Run, OpenWorkError> {
+        // Transition Queued/Planning → Running
+        let run = self.transition(
+            &run.id,
+            run.revision,
+            RunStatus::Running,
+            None,
+            actor.clone(),
+            now,
+        )?;
+
+        // Execute in sandbox
+        let result = sandbox.execute(request).map_err(|error| {
+            // Best-effort: record the failure as a terminal event
+            let _ = self.store.transition_run(
+                &run.id,
+                run.revision + 1,
+                RunStatus::Failed,
+                Some("sandbox execution failed"),
+                audit(actor.clone(), UtcTimestamp::now()),
+            );
+            error
+        })?;
+
+        // Scan output artifacts (only when the container exited cleanly)
+        let completed_at = UtcTimestamp::now();
+        let exited_clean = matches!(
+            result.termination,
+            crate::SandboxTermination::Exited
+        );
+        let _artifacts = if exited_clean {
+            match self.record_artifacts(
+                &run.id,
+                request.output_directory.as_path(),
+                &result.output_paths,
+                actor.clone(),
+                completed_at,
+            ) {
+                Ok(artifacts) => artifacts,
+                Err(error) => {
+                    let _ = self.store.transition_run(
+                        &run.id,
+                        run.revision + 1,
+                        RunStatus::Failed,
+                        Some("artifact validation failed"),
+                        audit(actor, completed_at),
+                    );
+                    return Err(error);
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        // Determine terminal status
+        let (terminal, reason) = match result.termination {
+            crate::SandboxTermination::Exited if result.exit_code == Some(0) => {
+                (RunStatus::Succeeded, None)
+            }
+            crate::SandboxTermination::Exited => (
+                RunStatus::Failed,
+                Some("provider exited with non-zero code"),
+            ),
+            crate::SandboxTermination::Cancelled => (
+                RunStatus::Cancelled,
+                Some("sandbox was cancelled"),
+            ),
+            crate::SandboxTermination::TimedOut => (
+                RunStatus::TimedOut,
+                Some("sandbox timed out"),
+            ),
+            crate::SandboxTermination::OutOfMemory => (
+                RunStatus::Failed,
+                Some("sandbox out of memory"),
+            ),
+            crate::SandboxTermination::Failed => (
+                RunStatus::Failed,
+                Some("sandbox execution failed"),
+            ),
+        };
+
+        let reason_str: Option<&str> = reason;
+        self.transition(
+            &run.id,
+            run.revision + 1,
+            terminal,
+            reason_str,
+            actor,
+            completed_at,
+        )
     }
 
     #[must_use]
