@@ -57,7 +57,16 @@ impl<C: DockerCli> DockerSandbox<C> {
     }
 
     fn invoke(&self, args: &[OsString], limit: u64) -> Result<CliOutput, OpenWorkError> {
-        self.cli.run(args, limit, CLI_TIMEOUT)
+        self.cli.run(args, limit, CLI_TIMEOUT, &[])
+    }
+
+    fn invoke_with_stdin(
+        &self,
+        args: &[OsString],
+        limit: u64,
+        stdin: &[u8],
+    ) -> Result<CliOutput, OpenWorkError> {
+        self.cli.run(args, limit, CLI_TIMEOUT, stdin)
     }
 
     fn execute_inner(&self, request: &SandboxRequest) -> Result<SandboxResult, OpenWorkError> {
@@ -90,7 +99,21 @@ impl<C: DockerCli> DockerSandbox<C> {
         let _registration =
             ActiveRegistration::insert(Arc::clone(&self.active), key, Arc::clone(&active))?;
         let started_at = UtcTimestamp::now();
-        let start = self.invoke(&os_args(["start", &container_id]), CONTROL_OUTPUT_LIMIT)?;
+        let has_stdin = !request.command.stdin().is_empty();
+        let start_args: Vec<OsString> = if has_stdin {
+            os_args(["start", "-a", "-i", &container_id])
+        } else {
+            os_args(["start", &container_id])
+        };
+        let start = if has_stdin {
+            self.invoke_with_stdin(
+                &start_args,
+                CONTROL_OUTPUT_LIMIT,
+                request.command.stdin(),
+            )
+        } else {
+            self.invoke(&start_args, CONTROL_OUTPUT_LIMIT)
+        }?;
         let (mut termination, mut exit_code) = (SandboxTermination::Failed, None);
         if start.success {
             let deadline = Instant::now() + Duration::from_secs(request.limits.timeout_seconds());
@@ -318,11 +341,13 @@ impl<C: DockerCli> ContainerGuard<C> {
             &os_args(["kill", &self.container_id]),
             CONTROL_OUTPUT_LIMIT,
             CLI_TIMEOUT,
+            &[],
         );
         let removed = self.cli.run(
             &os_args(["rm", "--force", &self.container_id]),
             CONTROL_OUTPUT_LIMIT,
             CLI_TIMEOUT,
+            &[],
         );
         self.cleaned = removed.as_ref().is_ok_and(|output| output.success);
         if self.cleaned {
@@ -399,6 +424,9 @@ fn create_arguments(
         "--tmpfs",
         "/tmp:rw,noexec,nosuid,nodev,size=67108864",
     );
+    if !request.command.stdin().is_empty() {
+        args.push(OsString::from("-i"));
+    }
     args.push(OsString::from(request.image.as_str()));
     args.push(OsString::from(request.command.program()));
     args.extend(request.command.arguments().iter().map(OsString::from));

@@ -66,6 +66,7 @@ impl DockerCli for FakeDockerCli {
         arguments: &[OsString],
         max_output_bytes: u64,
         _timeout: Duration,
+        _stdin: &[u8],
     ) -> Result<CliOutput, OpenWorkError> {
         let args = arguments
             .iter()
@@ -453,7 +454,7 @@ fn system_cli_clears_environment_and_bounds_output() {
         .expect("absolute executable")
         .with_cli_environment(OsString::from("EXPLICIT"), OsString::from("visible"));
     let environment = cli
-        .run(&[], 1024, Duration::from_secs(2))
+        .run(&[], 1024, Duration::from_secs(2), &[])
         .expect("env output");
     assert_eq!(
         String::from_utf8(environment.stdout).unwrap(),
@@ -466,6 +467,7 @@ fn system_cli_clears_environment_and_bounds_output() {
             &[OsString::from("0123456789abcdef")],
             7,
             Duration::from_secs(2),
+            &[],
         )
         .expect("printf output");
     assert_eq!(bounded.stdout.len() + bounded.stderr.len(), 7);
@@ -473,7 +475,7 @@ fn system_cli_clears_environment_and_bounds_output() {
 
     let sleep = SystemDockerCli::new(PathBuf::from("/bin/sleep")).unwrap();
     let timeout = sleep
-        .run(&[OsString::from("2")], 16, Duration::from_millis(10))
+        .run(&[OsString::from("2")], 16, Duration::from_millis(10), &[])
         .unwrap_err();
     assert_eq!(timeout.code, ErrorCode::RunTimedOut);
 }

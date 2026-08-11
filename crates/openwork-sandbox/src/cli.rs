@@ -22,6 +22,9 @@ pub struct CliOutput {
 pub trait DockerCli: Send + Sync {
     /// Runs Docker without a shell and retains at most `max_output_bytes` in total.
     ///
+    /// When `stdin` is non-empty the command receives it on standard input.
+    /// Implementations must bound the write to prevent blocking the child process.
+    ///
     /// # Errors
     ///
     /// Returns a redacted error when the process cannot run, times out, or cannot be read.
@@ -30,6 +33,7 @@ pub trait DockerCli: Send + Sync {
         arguments: &[OsString],
         max_output_bytes: u64,
         timeout: Duration,
+        stdin: &[u8],
     ) -> Result<CliOutput, OpenWorkError>;
 }
 
@@ -75,18 +79,39 @@ impl DockerCli for SystemDockerCli {
         arguments: &[OsString],
         max_output_bytes: u64,
         timeout: Duration,
+        stdin: &[u8],
     ) -> Result<CliOutput, OpenWorkError> {
+        let stdin_cfg = if stdin.is_empty() {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        };
         let mut child = Command::new(&self.executable)
             .args(arguments)
             .env_clear()
             .envs(&self.environment)
-            .stdin(Stdio::null())
+            .stdin(stdin_cfg)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|_| {
                 sandbox_error(ErrorCode::SandboxUnavailable, "Docker CLI could not start")
             })?;
+
+        // Write stdin in a background thread so the child doesn't block on a full pipe.
+        if !stdin.is_empty() {
+            let mut stdin_writer = child
+                .stdin
+                .take()
+                .expect("stdin pipe is available when non-empty");
+            let data = stdin.to_vec();
+            thread::spawn(move || {
+                use std::io::Write;
+                let _ = stdin_writer.write_all(&data);
+                // stdin_writer is dropped here, closing the pipe.
+            });
+        }
+
         let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
             let _ = child.kill();
             let _ = child.wait();
