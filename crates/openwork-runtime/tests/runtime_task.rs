@@ -120,8 +120,6 @@ fn codex_preparation_sets_explicit_defense_in_depth_flags() {
         "--ignore-user-config",
         "--ignore-rules",
         "--strict-config",
-        "--ask-for-approval",
-        "never",
         "--sandbox",
         "workspace-write",
         "--skip-git-repo-check",
@@ -135,6 +133,18 @@ fn codex_preparation_sets_explicit_defense_in_depth_flags() {
         args.windows(2)
             .any(|pair| pair == ["--cd", "/workspace/output"])
     );
+    // --ask-for-approval was removed from the Codex CLI (post v0.128);
+    // --full-auto is deprecated in favour of --sandbox <mode>.
+    // Neither flag should appear in a current invocation.
+    for removed_flag in [
+        "--ask-for-approval",
+        "--full-auto",
+    ] {
+        assert!(
+            !args.iter().any(|argument| argument == removed_flag),
+            "removed/deprecated flag {removed_flag} must not be present"
+        );
+    }
     assert!(!args.iter().any(|argument| {
         argument == "--yolo" || argument == "--dangerously-bypass-approvals-and-sandbox"
     }));

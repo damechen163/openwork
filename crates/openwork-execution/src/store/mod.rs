@@ -12,6 +12,9 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+#[cfg(feature = "postgres")]
+pub mod postgres;
+
 /// Storage transaction boundary implemented by memory storage now and Postgres later.
 pub trait ExecutionStore: Send + Sync {
     /// Creates a queued run and its genesis audit event atomically.

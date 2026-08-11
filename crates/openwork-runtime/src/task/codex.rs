@@ -9,6 +9,11 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 pub const CODEX_RUNTIME_ID: &str = "codex";
+/// Every flag the adapter always passes to the Codex CLI (`codex exec`).
+/// The `exec` subcommand is listed as the first entry because it is
+/// required to invoke non-interactive mode.  Values that vary per
+/// invocation (sandbox mode, working directory) are supplied separately
+/// at call time and are not listed here.
 pub const CODEX_REQUIRED_FLAGS: &[&str] = &[
     "exec",
     "--json",
@@ -16,10 +21,10 @@ pub const CODEX_REQUIRED_FLAGS: &[&str] = &[
     "--ignore-user-config",
     "--ignore-rules",
     "--strict-config",
-    "--ask-for-approval never",
     "--sandbox",
     "--cd",
     "--skip-git-repo-check",
+    "-",
 ];
 
 /// Prepares the current documented Codex non-interactive JSONL protocol.
@@ -58,8 +63,6 @@ impl RuntimeTaskAdapter for CodexTaskAdapter {
                 "--ignore-user-config".to_owned(),
                 "--ignore-rules".to_owned(),
                 "--strict-config".to_owned(),
-                "--ask-for-approval".to_owned(),
-                "never".to_owned(),
                 "--sandbox".to_owned(),
                 sandbox.to_owned(),
                 "--cd".to_owned(),

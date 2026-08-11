@@ -9,16 +9,20 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 pub const CLAUDE_RUNTIME_ID: &str = "claude-code";
+/// Every flag the adapter always passes to the Claude Code CLI.
+/// Values that vary per invocation (tools list, permission mode)
+/// are supplied separately at call time and are not listed here.
 pub const CLAUDE_REQUIRED_FLAGS: &[&str] = &[
-    "--print",
-    "--output-format stream-json",
     "--safe-mode",
+    "--print",
+    "--output-format",
+    "--verbose",
     "--no-session-persistence",
     "--no-chrome",
     "--disable-slash-commands",
+    "--strict-mcp-config",
     "--tools",
     "--permission-mode",
-    "--strict-mcp-config",
 ];
 
 /// Prepares the current documented Claude Code non-interactive JSON stream.

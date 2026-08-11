@@ -136,10 +136,11 @@ impl<S: ExecutionStore> ExecutionOrchestrator<S> {
 
         // Execute in sandbox
         let result = sandbox.execute(request).map_err(|error| {
-            // Best-effort: record the failure as a terminal event
+            // Best-effort: record the failure as a terminal event.
+            // run.revision is the current revision from the first transition.
             let _ = self.store.transition_run(
                 &run.id,
-                run.revision + 1,
+                run.revision,
                 RunStatus::Failed,
                 Some("sandbox execution failed"),
                 audit(actor.clone(), UtcTimestamp::now()),
@@ -165,7 +166,7 @@ impl<S: ExecutionStore> ExecutionOrchestrator<S> {
                 Err(error) => {
                     let _ = self.store.transition_run(
                         &run.id,
-                        run.revision + 1,
+                        run.revision,
                         RunStatus::Failed,
                         Some("artifact validation failed"),
                         audit(actor, completed_at),
@@ -207,7 +208,7 @@ impl<S: ExecutionStore> ExecutionOrchestrator<S> {
         let reason_str: Option<&str> = reason;
         self.transition(
             &run.id,
-            run.revision + 1,
+            run.revision,
             terminal,
             reason_str,
             actor,
