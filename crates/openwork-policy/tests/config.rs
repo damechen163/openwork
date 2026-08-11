@@ -36,6 +36,10 @@ fn unknown_duplicate_and_unsafe_config_fail_closed() {
             "decision: allow\n    resources:",
         ),
         VALID.replace("decision: deny\n", "decision: allow\n"),
+        VALID.replace(
+            "decision: allow\n  email.send:",
+            "decision: allow\n    resources: null\n  email.send:",
+        ),
         format!("{VALID}\nextra: true"),
         format!("{VALID}\nactions:\n  filesystem.read:\n    risk: L0\n    decision: allow"),
     ] {

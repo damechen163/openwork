@@ -34,6 +34,7 @@ struct PolicyDefaults {
 pub struct ActionRule {
     risk: RiskLevel,
     decision: ConfiguredDecision,
+    #[serde(default, deserialize_with = "non_null_option")]
     resources: Option<ResourceRules>,
 }
 
@@ -70,7 +71,6 @@ impl PolicyConfig {
         Ok(config)
     }
 
-    #[allow(dead_code)] // consumed by the evaluator in the next reviewable commit
     pub(crate) fn action(&self, name: &str) -> Option<&ActionRule> {
         self.actions.get(name)
     }
@@ -91,17 +91,14 @@ impl PolicyConfig {
 }
 
 impl ActionRule {
-    #[allow(dead_code)] // consumed by the evaluator in the next reviewable commit
     pub(crate) const fn risk(&self) -> RiskLevel {
         self.risk
     }
 
-    #[allow(dead_code)] // consumed by the evaluator in the next reviewable commit
     pub(crate) const fn decision(&self) -> ConfiguredDecision {
         self.decision
     }
 
-    #[allow(dead_code)] // consumed by the evaluator in the next reviewable commit
     pub(crate) const fn resources(&self) -> Option<&ResourceRules> {
         self.resources.as_ref()
     }
@@ -128,12 +125,10 @@ impl ActionRule {
 }
 
 impl ResourceRules {
-    #[allow(dead_code)] // consumed by the evaluator in the next reviewable commit
     pub(crate) fn exact(&self) -> &BTreeMap<String, ConfiguredDecision> {
         &self.exact
     }
 
-    #[allow(dead_code)] // consumed by the evaluator in the next reviewable commit
     pub(crate) const fn default_decision(&self) -> ConfiguredDecision {
         self.default
     }
@@ -195,6 +190,14 @@ where
         }
     }
     deserializer.deserialize_map(UniqueMapVisitor(PhantomData))
+}
+
+fn non_null_option<'de, D, V>(deserializer: D) -> Result<Option<V>, D::Error>
+where
+    D: Deserializer<'de>,
+    V: Deserialize<'de>,
+{
+    V::deserialize(deserializer).map(Some)
 }
 
 fn config_error(message: &str) -> OpenWorkError {
