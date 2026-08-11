@@ -1,21 +1,24 @@
 use crate::{
     AgentRuntime, AuthStatus, CancellationToken, CommandRunner, CommandSpec, DetectionState,
     DistributionModel, DownloadRequest, Downloader, RuntimeCapabilities, RuntimeDetection,
-    RuntimeDoctorCheck, RuntimeEvent, RuntimeId, RuntimeInstallOutcome, RuntimeInstallPlan,
-    RuntimeMetadata, RuntimeResult, RuntimeRunRequest,
+    RuntimeDoctorCheck, RuntimeEvent, RuntimeEventKind, RuntimeId, RuntimeInstallOutcome,
+    RuntimeInstallPlan, RuntimeMetadata, RuntimeResult, RuntimeRunRequest,
 };
 use openwork_core::{ErrorCode, OpenWorkError, redact_text};
 use openwork_platform::{OperatingSystem, PlatformInfo};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const UNIX_INSTALL_URL: &str = "https://claude.ai/install.sh";
 const WINDOWS_INSTALL_URL: &str = "https://claude.ai/install.ps1";
+const DEFAULT_RUN_TIMEOUT_SECONDS: u64 = 300;
+const MAX_RUN_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 
 pub struct ClaudeRuntime {
     runner: Arc<dyn CommandRunner>,
     downloader: Option<Arc<dyn Downloader>>,
     platform: PlatformInfo,
+    active_run: Mutex<Option<CancellationToken>>,
 }
 
 impl ClaudeRuntime {
@@ -29,6 +32,7 @@ impl ClaudeRuntime {
             runner,
             downloader,
             platform,
+            active_run: Mutex::new(None),
         }
     }
 
@@ -255,21 +259,112 @@ impl AgentRuntime for ClaudeRuntime {
             uninstall: false,
             update: true,
             authenticate: true,
-            run: false,
-            cancel: false,
+            run: true,
+            cancel: true,
         }
     }
 
     fn run(
         &self,
-        _: &RuntimeRunRequest,
-        _: &CancellationToken,
+        request: &RuntimeRunRequest,
+        cancellation: &CancellationToken,
     ) -> RuntimeResult<Vec<RuntimeEvent>> {
-        Err(Self::unsupported("run"))
+        let executable = self.executable().ok_or_else(|| {
+            OpenWorkError::new(ErrorCode::RuntimeNotFound, "Claude Code is not installed")
+        })?;
+        if cancellation.is_cancelled() {
+            return Ok(vec![RuntimeEvent {
+                kind: RuntimeEventKind::Cancelled,
+                message: "Claude Code run cancelled before start".to_owned(),
+            }]);
+        }
+        let timeout = Duration::from_secs(
+            request
+                .timeout_seconds
+                .unwrap_or(DEFAULT_RUN_TIMEOUT_SECONDS),
+        );
+        let spec = CommandSpec::new(
+            executable,
+            vec![
+                "-p".to_owned(),
+                "--output-format".to_owned(),
+                "text".to_owned(),
+                "--verbose".to_owned(),
+                "--max-turns".to_owned(),
+                "60".to_owned(),
+                // Non-interactive runs cannot answer permission prompts; allow
+                // file writes explicitly and keep everything else denied.
+                "--allowedTools".to_owned(),
+                "Write,Edit".to_owned(),
+                "--permission-mode".to_owned(),
+                "acceptEdits".to_owned(),
+            ],
+            timeout,
+        )
+        .with_stdin(request.prompt.clone())
+        .with_capture_bytes(MAX_RUN_CAPTURE_BYTES);
+        let spec = match &request.working_directory {
+            Some(directory) => spec.with_working_directory(directory.clone()),
+            None => spec,
+        };
+        *self.active_run.lock().expect("active run mutex poisoned") = Some(cancellation.clone());
+        let output = self.runner.run(&spec, cancellation);
+        *self.active_run.lock().expect("active run mutex poisoned") = None;
+        let output = output?;
+        if cancellation.is_cancelled() || output.cancelled {
+            return Err(OpenWorkError::new(
+                ErrorCode::RunCancelled,
+                "Claude Code run was cancelled",
+            ));
+        }
+        if output.timed_out {
+            return Err(OpenWorkError::new(
+                ErrorCode::RunTimedOut,
+                format!("Claude Code run exceeded {timeout:?}"),
+            ));
+        }
+        if output.exit_code != Some(0) {
+            return Err(OpenWorkError::new(
+                ErrorCode::ExecutionFailed,
+                format!(
+                    "Claude Code exited with {:?}: {}",
+                    output.exit_code,
+                    redact_text(&output.stderr)
+                ),
+            ));
+        }
+        let mut events = vec![RuntimeEvent {
+            kind: RuntimeEventKind::Started,
+            message: "Claude Code run started".to_owned(),
+        }];
+        let mut output_text = output.stdout;
+        if output_text.trim().is_empty() {
+            output_text = output.stderr;
+        }
+        if !output_text.trim().is_empty() {
+            events.push(RuntimeEvent {
+                kind: RuntimeEventKind::Output,
+                message: redact_text(&output_text),
+            });
+        }
+        events.push(RuntimeEvent {
+            kind: RuntimeEventKind::Completed,
+            message: "Claude Code run completed".to_owned(),
+        });
+        Ok(events)
     }
 
-    fn cancel(&self, _: &CancellationToken) -> RuntimeResult<()> {
-        Err(Self::unsupported("cancel"))
+    fn cancel(&self, cancellation: &CancellationToken) -> RuntimeResult<()> {
+        cancellation.cancel();
+        if let Some(active) = self
+            .active_run
+            .lock()
+            .expect("active run mutex poisoned")
+            .as_ref()
+        {
+            active.cancel();
+        }
+        Ok(())
     }
 }
 
@@ -472,5 +567,128 @@ mod tests {
             .unwrap();
         assert!(outcome.installed);
         assert_eq!(*downloader.calls.lock().unwrap(), 1);
+    }
+
+    struct RecordingRunner {
+        executable: bool,
+        specs: Mutex<Vec<CommandSpec>>,
+        outputs: Mutex<VecDeque<CommandOutput>>,
+    }
+    impl CommandRunner for RecordingRunner {
+        fn find_executable(&self, _: &str) -> Option<PathBuf> {
+            self.executable.then(|| PathBuf::from("/fixture/claude"))
+        }
+        fn run(&self, spec: &CommandSpec, _: &CancellationToken) -> RuntimeResult<CommandOutput> {
+            self.specs.lock().unwrap().push(spec.clone());
+            self.outputs
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| OpenWorkError::new(ErrorCode::Internal, "missing fake output"))
+        }
+    }
+    fn recording_runtime(outputs: Vec<CommandOutput>) -> (ClaudeRuntime, Arc<RecordingRunner>) {
+        let runner = Arc::new(RecordingRunner {
+            executable: true,
+            specs: Mutex::new(Vec::new()),
+            outputs: Mutex::new(outputs.into()),
+        });
+        let runtime = ClaudeRuntime::new(runner.clone(), None, platform(OperatingSystem::Linux));
+        (runtime, runner)
+    }
+
+    #[test]
+    fn run_forwards_prompt_on_stdin_and_streams_events() {
+        let (runtime, runner) =
+            recording_runtime(vec![output(Some(0), "analysis complete", "", false)]);
+        let events = runtime
+            .run(
+                &RuntimeRunRequest {
+                    prompt: "TOKEN=synthetic-secret analyze".to_owned(),
+                    working_directory: Some(PathBuf::from("/fixture/workspace")),
+                    timeout_seconds: Some(42),
+                },
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].kind, RuntimeEventKind::Started);
+        assert_eq!(events[1].kind, RuntimeEventKind::Output);
+        assert_eq!(events[2].kind, RuntimeEventKind::Completed);
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.message.contains("synthetic-secret"))
+        );
+
+        let spec = &runner.specs.lock().unwrap()[0];
+        assert!(spec.arguments.iter().any(|argument| argument == "-p"));
+        assert!(
+            spec.arguments
+                .iter()
+                .any(|argument| argument == "--max-turns")
+        );
+        assert!(spec.arguments.iter().any(|argument| argument == "60"));
+        assert_eq!(
+            spec.stdin.as_deref(),
+            Some("TOKEN=synthetic-secret analyze")
+        );
+        assert_eq!(
+            spec.working_directory,
+            Some(PathBuf::from("/fixture/workspace"))
+        );
+        assert_eq!(spec.timeout_millis, 42_000);
+    }
+
+    #[test]
+    fn run_maps_timeout_and_cancellation() {
+        let (runtime, _) = recording_runtime(vec![output(None, "", "", true)]);
+        let error = runtime
+            .run(
+                &RuntimeRunRequest {
+                    prompt: "work".to_owned(),
+                    working_directory: None,
+                    timeout_seconds: None,
+                },
+                &CancellationToken::new(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::RunTimedOut);
+
+        let (runtime, _) = recording_runtime(vec![CommandOutput {
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+            cancelled: true,
+            truncated: false,
+        }]);
+        let error = runtime
+            .run(
+                &RuntimeRunRequest {
+                    prompt: "work".to_owned(),
+                    working_directory: None,
+                    timeout_seconds: None,
+                },
+                &CancellationToken::new(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::RunCancelled);
+    }
+
+    #[test]
+    fn run_reports_nonzero_exit() {
+        let (runtime, _) = recording_runtime(vec![output(Some(1), "", "boom", false)]);
+        let error = runtime
+            .run(
+                &RuntimeRunRequest {
+                    prompt: "work".to_owned(),
+                    working_directory: None,
+                    timeout_seconds: None,
+                },
+                &CancellationToken::new(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ExecutionFailed);
     }
 }

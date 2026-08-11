@@ -85,6 +85,12 @@ enum Command {
         /// Wait for the run to complete before returning.
         #[arg(long)]
         wait: bool,
+        /// Wall-clock budget for the runtime phase, in seconds.
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+        /// Wall-clock budget for the sandbox phase, in seconds (1..=3600).
+        #[arg(long, default_value_t = 60)]
+        sandbox_timeout: u64,
         /// Emit a structured error or result.
         #[arg(long)]
         json: bool,
@@ -252,8 +258,10 @@ fn execute(cli: Cli, probe: &impl PlatformProbe) -> Result<u8, (OpenWorkError, b
             workspace,
             prompt,
             wait: _wait,
+            timeout,
+            sandbox_timeout,
             json,
-        } => execute_run(&runtime, &workspace, &prompt, json),
+        } => execute_run(&runtime, &workspace, &prompt, timeout, sandbox_timeout, json),
         Command::Demo { command } => execute_demo(command),
         Command::Runtime {
             command: RuntimeCommand::Info { id, json },
@@ -579,27 +587,91 @@ fn execute_run(
     runtime: &str,
     workspace: &str,
     prompt: &str,
+    timeout: u64,
+    sandbox_timeout: u64,
     json: bool,
 ) -> Result<u8, (OpenWorkError, bool)> {
-    if !matches!(runtime, "claude-code" | "codex")
-        || prompt.is_empty()
-        || !Path::new(workspace).is_dir()
-    {
-        return Err((
-            OpenWorkError::new(ErrorCode::InvalidArguments, "invalid run request"),
+    let host = platform(&SystemPlatformProbe, json)?;
+    let registry = runtime_registry(&host);
+    let normalized = normalize_runtime_id(runtime).to_owned();
+    let runtime_ref = registry
+        .get(&RuntimeId::from(normalized.as_str()))
+        .ok_or_else(|| {
+            (
+                OpenWorkError::new(
+                    ErrorCode::RuntimeNotFound,
+                    format!("runtime `{normalized}` is not registered"),
+                )
+                .with_remediation("Run `openwork runtime list` to see available runtimes."),
+                json,
+            )
+        })?;
+
+    let user = SandboxUser::new(SANDBOX_UID, SANDBOX_GID).map_err(|error| (error, json))?;
+    let image = DigestPinnedImageRef::parse(SANDBOX_IMAGE).map_err(|error| (error, json))?;
+    let limits = SandboxLimits::new(30_000, 512 * 1024 * 1024, 512, sandbox_timeout, 16 * 1024 * 1024)
+        .map_err(|error| (error, json))?;
+
+    let plan = run::RunPlan {
+        workspace: std::path::PathBuf::from(workspace),
+        prompt: prompt.to_owned(),
+        runtime_id: normalized,
+        runtime_timeout: Duration::from_secs(timeout),
+        image,
+        user,
+        limits,
+    };
+
+    let store = InMemoryExecutionStore::default();
+    let scanner =
+        ArtifactScanner::new(100 * 1024 * 1024).map_err(|error| (error, json))?;
+    let orchestrator = ExecutionOrchestrator::new(store, scanner);
+    let backend = Arc::new(PodmanSandboxBackend::new(Arc::new(SystemCommandRunner)));
+    let token = openwork_runtime::CancellationToken::new();
+    let active_run_id: Arc<Mutex<Option<openwork_execution::RunId>>> =
+        Arc::new(Mutex::new(None));
+    let signal_token = token.clone();
+    let signal_backend = backend.clone();
+    let signal_run_id = active_run_id.clone();
+    ctrlc::set_handler(move || {
+        signal_token.cancel();
+        if let Some(run_id) = signal_run_id.lock().expect("run id mutex poisoned").as_ref() {
+            let _ = signal_backend.cancel(run_id);
+        }
+    })
+    .map_err(|error| {
+        (
+            OpenWorkError::new(
+                ErrorCode::Internal,
+                format!("signal handler failed: {error}"),
+            ),
             json,
-        ));
-    }
-    Err((
-        OpenWorkError::new(
-            ErrorCode::SandboxUnavailable,
-            "no durable runtime worker is configured; no run was created",
         )
-        .with_remediation(
-            "Configure the Control API and a sandbox worker, or run `openwork demo sales` to verify the local M1 execution path.",
-        ),
-        json,
-    ))
+    })?;
+
+    let register_run_id = |run_id: &openwork_execution::RunId| {
+        *active_run_id.lock().expect("run id mutex poisoned") = Some(run_id.clone());
+    };
+    let report = run::run_loop(
+        &orchestrator,
+        runtime_ref.as_ref(),
+        backend.as_ref(),
+        &token,
+        &plan,
+        &register_run_id,
+    )
+    .map_err(|error| {
+        *active_run_id.lock().expect("run id mutex poisoned") = None;
+        (error, json)
+    })?;
+    render_run(&report, json);
+    let exit_code = match report.status {
+        openwork_execution::RunStatus::Succeeded => 0,
+        openwork_execution::RunStatus::Cancelled => ErrorCode::RunCancelled.exit_code(),
+        openwork_execution::RunStatus::TimedOut => ErrorCode::RunTimedOut.exit_code(),
+        _ => ErrorCode::ExecutionFailed.exit_code(),
+    };
+    Ok(exit_code)
 }
 
 fn execute_demo(command: DemoCommand) -> Result<u8, (OpenWorkError, bool)> {

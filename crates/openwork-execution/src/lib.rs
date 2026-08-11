@@ -100,6 +100,12 @@ macro_rules! uuid_v7_id {
                 Ok(Self(uuid))
             }
         }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(&self.0.to_string())
+            }
+        }
     };
 }
 

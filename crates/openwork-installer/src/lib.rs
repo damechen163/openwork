@@ -697,6 +697,8 @@ mod tests {
                 environment: BTreeMap::new(),
                 working_directory: None,
                 timeout_millis: 1_000,
+                stdin: None,
+                capture_bytes: openwork_runtime::MAX_CAPTURE_BYTES,
             }],
             warnings: vec![],
         };

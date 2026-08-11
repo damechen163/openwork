@@ -128,6 +128,8 @@ pub struct RuntimeInstallOutcome {
 pub struct RuntimeRunRequest {
     pub prompt: String,
     pub working_directory: Option<PathBuf>,
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -173,6 +175,14 @@ pub struct CommandSpec {
     pub environment: BTreeMap<String, String>,
     pub working_directory: Option<PathBuf>,
     pub timeout_millis: u64,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub stdin: Option<String>,
+    #[serde(default = "default_capture_bytes")]
+    pub capture_bytes: usize,
+}
+
+fn default_capture_bytes() -> usize {
+    MAX_CAPTURE_BYTES
 }
 
 impl CommandSpec {
@@ -184,7 +194,27 @@ impl CommandSpec {
             environment: BTreeMap::new(),
             working_directory: None,
             timeout_millis: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            stdin: None,
+            capture_bytes: MAX_CAPTURE_BYTES,
         }
+    }
+
+    #[must_use]
+    pub fn with_stdin(mut self, input: impl Into<String>) -> Self {
+        self.stdin = Some(input.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_working_directory(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.working_directory = Some(directory.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_capture_bytes(mut self, capture_bytes: usize) -> Self {
+        self.capture_bytes = capture_bytes;
+        self
     }
 }
 
@@ -225,16 +255,46 @@ impl CommandRunner for SystemCommandRunner {
         let mut process = Command::new(&command.program);
         process.args(&command.arguments);
         process.envs(&command.environment);
-        process
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
         if let Some(directory) = &command.working_directory {
             process.current_dir(directory);
         }
+        process
+            .stdin(if command.stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = process.spawn().map_err(command_error)?;
-        let stdout = child.stdout.take().map(read_stream);
-        let stderr = child.stderr.take().map(read_stream);
+        if let Some(input) = &command.stdin
+            && let Some(mut pipe) = child.stdin.take()
+        {
+            let input = input.clone();
+            thread::spawn(move || {
+                use std::io::Write;
+                let _ = pipe.write_all(input.as_bytes());
+                let _ = pipe.flush();
+            });
+        }
+        Self::run_wait(child, command, cancellation)
+    }
+}
+
+impl SystemCommandRunner {
+    fn run_wait(
+        mut child: std::process::Child,
+        command: &CommandSpec,
+        cancellation: &CancellationToken,
+    ) -> RuntimeResult<CommandOutput> {
+        let stdout = child
+            .stdout
+            .take()
+            .map(|stream| read_stream(stream, command.capture_bytes));
+        let stderr = child
+            .stderr
+            .take()
+            .map(|stream| read_stream(stream, command.capture_bytes));
         let started = Instant::now();
         let timeout = Duration::from_millis(command.timeout_millis);
         let mut timed_out = false;
@@ -308,7 +368,10 @@ pub trait Downloader: Send + Sync {
     ) -> RuntimeResult<DownloadReceipt>;
 }
 
-fn read_stream(mut stream: impl Read + Send + 'static) -> thread::JoinHandle<(String, bool)> {
+fn read_stream(
+    mut stream: impl Read + Send + 'static,
+    capture_bytes: usize,
+) -> thread::JoinHandle<(String, bool)> {
     thread::spawn(move || {
         let mut captured = Vec::new();
         let mut buffer = [0_u8; 8192];
@@ -317,7 +380,7 @@ fn read_stream(mut stream: impl Read + Send + 'static) -> thread::JoinHandle<(St
             if count == 0 {
                 break;
             }
-            let remaining = MAX_CAPTURE_BYTES.saturating_sub(captured.len());
+            let remaining = capture_bytes.saturating_sub(captured.len());
             captured.extend_from_slice(&buffer[..count.min(remaining)]);
             truncated |= count > remaining;
         }
@@ -394,7 +457,9 @@ mod tests {
     #[test]
     fn command_output_is_capture_bounded() {
         let input = vec![b'x'; MAX_CAPTURE_BYTES + 16];
-        let (output, truncated) = read_stream(std::io::Cursor::new(input)).join().unwrap();
+        let (output, truncated) = read_stream(std::io::Cursor::new(input), MAX_CAPTURE_BYTES)
+            .join()
+            .unwrap();
         assert_eq!(output.len(), MAX_CAPTURE_BYTES);
         assert!(truncated);
     }

@@ -99,6 +99,18 @@ jobs:
       - run: cargo build --release --locked
       - run: test "$(target/release/openwork --version)" = "OpenWork 0.1.0"
 
+  sandbox-integration:
+    name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: sandbox-integration' || 'sandbox-integration' }}"
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+      - run: cargo test -p openwork-sandbox --test podman_integration --locked -- --ignored --test-threads 1
+
   clippy:
     name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: clippy' || 'clippy' }}"
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false

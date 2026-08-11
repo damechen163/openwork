@@ -60,6 +60,7 @@ pub fn exercise_isolated_runtime(runtime: &dyn AgentRuntime) -> RuntimeResult<Co
     let request = RuntimeRunRequest {
         prompt: "TOKEN=synthetic-secret say hello".to_owned(),
         working_directory: None,
+        timeout_seconds: None,
     };
     let events = runtime.run(&request, &CancellationToken::new())?;
     ensure(

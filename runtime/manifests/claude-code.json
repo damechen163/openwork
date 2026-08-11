@@ -12,8 +12,8 @@
     "uninstall": false,
     "update": true,
     "authenticate": true,
-    "run": false,
-    "cancel": false
+    "run": true,
+    "cancel": true
   },
   "installer_sources": [
     {
