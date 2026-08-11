@@ -76,6 +76,13 @@ expires_at` is expired, TTL cannot exceed 24 hours, an approval decision cannot
 extend expiry, and consumption requires the exact approved revision and binding
 inside the action-claim transaction.
 
+Approval lifecycle audit semantics are exact: expiry emits
+`approval_expired`, consumption emits `approval_consumed`, and neither is
+aliased to approval denial or approval grant. These two additive v1 event types
+were approved with the approval persistence implementation so stored audit
+meaning remains unambiguous without changing any approval DTO or state-machine
+semantics.
+
 ## License implications
 
 The contract adds only Apache-2.0/MIT-compatible dependencies recorded in the
