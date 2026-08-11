@@ -74,6 +74,17 @@ macro_rules! uuid_v7_id {
                 }
                 Ok(Self(uuid))
             }
+
+            #[must_use]
+            pub fn to_hyphenated(&self) -> String {
+                self.0.as_hyphenated().to_string()
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0.as_hyphenated())
+            }
         }
 
         impl<'de> Deserialize<'de> for $name {

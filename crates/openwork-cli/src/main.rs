@@ -569,13 +569,8 @@ fn execute_run(
         .create_run(runtime, workspace_path, actor, prompt, now)
         .map_err(|e| (e, false))?;
 
-    let run_id_str = serde_json::to_string(&run.id)
-        .unwrap_or_else(|_| "unknown".to_owned())
-        .trim_matches('"')
-        .to_owned();
-
     println!("OpenWork Run\n");
-    println!("  Run ID:    {run_id_str}");
+    println!("  Run ID:    {}", run.id);
     println!("  Runtime:   {}", run.runtime);
     println!("  Workspace:  {}", run.workspace.display());
     println!("  Status:    {:?}", run.status);
@@ -584,7 +579,7 @@ fn execute_run(
     if run.status == RunStatus::Queued {
         println!("Run created successfully. Execution requires a configured sandbox backend.");
         println!();
-        println!("Run ID: {run_id_str}");
+        println!("Run ID: {}", run.id);
         println!();
         println!("To execute with full sandbox isolation, ensure Docker is available");
         println!("and the sandbox backend is configured.");
