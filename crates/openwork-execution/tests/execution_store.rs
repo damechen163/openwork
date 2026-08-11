@@ -69,7 +69,11 @@ fn persistence_rechecks_public_contract_fields() {
     };
     assert!(
         store
-            .record_artifacts(&run.id, vec![invalid_artifact])
+            .record_artifacts(
+                &run.id,
+                vec![invalid_artifact],
+                audit("2026-08-10T00:00:01Z"),
+            )
             .is_err()
     );
     assert!(store.artifacts(&run.id).expect("artifacts").is_empty());
@@ -126,7 +130,12 @@ fn concurrent_cancel_and_complete_have_one_cas_winner() {
         .expect("stored run");
     assert!(stored.status.is_terminal());
     assert_eq!(stored.revision, 3);
-    assert_eq!(store.audit_events(&run.id).expect("audit").len(), 4);
+    let events = store.audit_events(&run.id).expect("audit");
+    assert_eq!(events.len(), 4);
+    assert_eq!(
+        events.last().expect("terminal event").metadata.as_map()["run_status"],
+        serde_json::to_value(stored.status).expect("status")
+    );
     assert!(
         !stored
             .terminal_reason
