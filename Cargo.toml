@@ -7,6 +7,7 @@ members = [
   "crates/openwork-execution",
   "crates/openwork-installer",
   "crates/openwork-platform",
+  "crates/openwork-policy",
   "crates/openwork-runtime",
 ]
 resolver = "2"
