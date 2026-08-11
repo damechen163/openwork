@@ -23,7 +23,8 @@ components remain disabled until their integration issue passes tests and licens
 | sysinfo          | 0.39.6             | MIT                                 | Read-only host memory and OS facts.                                                     |
 | fs2              | 0.4.3              | MIT OR Apache-2.0                    | Read-only filesystem capacity facts.                                                   |
 | jsonschema       | 0.49.9             | MIT                                 | Test-only Draft 2020-12 validation of checked-in execution contracts.                  |
-| serde_json       | 1.0.151            | MIT OR Apache-2.0                    | Development-time JSON diagnostic assertions.                                           |
+| serde_json       | 1.0.151            | MIT OR Apache-2.0                    | Versioned execution serialization, canonical hashing, and bounded Docker state parsing. |
+| yaml_serde       | 0.10.4             | MIT OR Apache-2.0                    | Versioned, fail-closed managed-action policy configuration parsing.                     |
 | clap             | 4.6.6              | MIT OR Apache-2.0                    | Rust command-line parsing and help output.                                              |
 | tempfile         | 3.27.0             | MIT OR Apache-2.0                    | Development-only dry-run side-effect tests.                                             |
 | atomicwrites     | 0.4.4              | MIT                                 | Cross-platform atomic replacement of OpenWork-managed state files.                      |
