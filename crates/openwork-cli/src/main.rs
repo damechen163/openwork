@@ -16,6 +16,12 @@ use openwork_runtime::{
     RuntimeDetection, RuntimeId, RuntimeInstallPlan, RuntimeMetadata, RuntimeRegistry,
     SystemCommandRunner, SystemDownloader,
 };
+use openwork_execution::{
+    ActorId, RunStatus, UtcTimestamp,
+};
+use openwork_execution::artifact::ArtifactScanner;
+use openwork_execution::orchestrator::ExecutionOrchestrator;
+use openwork_execution::store::InMemoryExecutionStore;
 use serde::Serialize;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -67,6 +73,21 @@ enum Command {
     Runtime {
         #[command(subcommand)]
         command: RuntimeCommand,
+    },
+    /// Execute a task through a managed runtime in a safe sandbox.
+    Run {
+        /// Target AI runtime (claude-code, codex).
+        #[arg(long, short)]
+        runtime: String,
+        /// Workspace directory containing input files.
+        #[arg(long, short)]
+        workspace: String,
+        /// Natural-language task description (supplied via stdin to the provider).
+        #[arg(trailing_var_arg = true, required = true)]
+        prompt: Vec<String>,
+        /// Wait for the run to complete before returning.
+        #[arg(long)]
+        wait: bool,
     },
 }
 
@@ -201,6 +222,12 @@ fn execute(cli: Cli, probe: &impl PlatformProbe) -> Result<u8, (OpenWorkError, b
             }
             Ok(0)
         }
+        Command::Run {
+            runtime,
+            workspace,
+            prompt,
+            wait: _wait,
+        } => execute_run(&runtime, &workspace, &prompt.join(" ")),
         Command::Runtime {
             command: RuntimeCommand::Info { id, json },
         } => {
@@ -519,6 +546,51 @@ fn resolved_runtime_entry(
             },
         },
     ))
+}
+
+fn execute_run(
+    runtime: &str,
+    workspace: &str,
+    prompt: &str,
+) -> Result<u8, (OpenWorkError, bool)> {
+    use std::path::Path;
+
+    let actor = ActorId::parse("cli-user").map_err(|e| (e, false))?;
+    let now = UtcTimestamp::now();
+    let workspace_path = Path::new(workspace);
+
+    // Create the orchestrator with in-memory store
+    let store = InMemoryExecutionStore::default();
+    let scanner = ArtifactScanner::new(100 * 1024 * 1024).map_err(|e| (e, false))?;
+    let orchestrator = ExecutionOrchestrator::new(store, scanner);
+
+    // Create the run — only the SHA-256 of the prompt is persisted
+    let run = orchestrator
+        .create_run(runtime, workspace_path, actor, prompt, now)
+        .map_err(|e| (e, false))?;
+
+    let run_id_str = serde_json::to_string(&run.id)
+        .unwrap_or_else(|_| "unknown".to_owned())
+        .trim_matches('"')
+        .to_owned();
+
+    println!("OpenWork Run\n");
+    println!("  Run ID:    {run_id_str}");
+    println!("  Runtime:   {}", run.runtime);
+    println!("  Workspace:  {}", run.workspace.display());
+    println!("  Status:    {:?}", run.status);
+    println!();
+
+    if run.status == RunStatus::Queued {
+        println!("Run created successfully. Execution requires a configured sandbox backend.");
+        println!();
+        println!("Run ID: {run_id_str}");
+        println!();
+        println!("To execute with full sandbox isolation, ensure Docker is available");
+        println!("and the sandbox backend is configured.");
+    }
+
+    Ok(0)
 }
 
 fn runtime_lockfile_path(host: &PlatformInfo) -> std::path::PathBuf {

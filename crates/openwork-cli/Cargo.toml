@@ -18,6 +18,9 @@ openwork-doctor = { path = "../openwork-doctor" }
 openwork-installer = { path = "../openwork-installer" }
 openwork-platform = { path = "../openwork-platform" }
 openwork-runtime = { path = "../openwork-runtime" }
+openwork-execution = { path = "../openwork-execution" }
+openwork-policy = { path = "../openwork-policy" }
+openwork-sandbox = { path = "../openwork-sandbox" }
 serde.workspace = true
 serde_json.workspace = true
 
