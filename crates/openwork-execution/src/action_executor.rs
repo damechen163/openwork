@@ -3,9 +3,9 @@
 use crate::approval::{ActionClaim, ApprovalRepository};
 use crate::audit::AuditAppend;
 use crate::store::ExecutionStore;
-use crate::{ActionId, ActionRequest, ActorId, AuditEventType, RunId, Sha256Digest, UtcTimestamp};
+use crate::{ActionId, ActionRequest, ActorId, RunId, Sha256Digest, UtcTimestamp};
 use openwork_core::{ErrorCode, OpenWorkError};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 /// An action whose exact run, action identity, and parameter hash match a
@@ -70,6 +70,26 @@ pub struct ActionExecutionReceipt {
     pub parameter_hash: Sha256Digest,
 }
 
+/// Result of an idempotent executor call.
+///
+/// `Recovered` means the executor found the exact durable receipt written
+/// before a prior successful side effect returned. Callers may reconcile a
+/// missing audit record, but must not invoke the external side effect again.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ActionExecutionOutcome {
+    Performed(ActionExecutionReceipt),
+    Recovered(ActionExecutionReceipt),
+}
+
+impl ActionExecutionOutcome {
+    fn into_receipt(self) -> (ActionExecutionReceipt, bool) {
+        match self {
+            Self::Performed(receipt) => (receipt, false),
+            Self::Recovered(receipt) => (receipt, true),
+        }
+    }
+}
+
 /// Side-effect boundary. Implementations can receive only a verified claimed
 /// action, never a bare model-authored request.
 pub trait ActionExecutor: Send + Sync {
@@ -77,9 +97,13 @@ pub trait ActionExecutor: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns an error when the exact claim has already executed or when the
-    /// implementation cannot safely perform the action.
-    fn execute(&self, action: ClaimedAction) -> Result<ActionExecutionReceipt, OpenWorkError>;
+    /// Implementations must durably record the exact receipt before reporting
+    /// a successful external side effect. A retry returns `Recovered` with that
+    /// receipt and must not repeat the side effect.
+    ///
+    /// Returns an error when the implementation cannot safely perform or
+    /// recover the exact action.
+    fn execute(&self, action: ClaimedAction) -> Result<ActionExecutionOutcome, OpenWorkError>;
 }
 
 /// Executes an exact claimed action and appends a typed, content-free audit
@@ -103,14 +127,25 @@ where
     S: ExecutionStore + ?Sized,
     E: ActionExecutor + ?Sized,
 {
-    let run_id = claimed.action().run_id.clone();
-    let receipt = executor.execute(claimed)?;
-    store.append_audit(
-        &run_id,
-        AuditEventType::ActionExecuted,
-        AuditAppend::new(actor, timestamp)
-            .with_action_execution(receipt.action_id.clone(), receipt.parameter_hash.clone()),
-    )?;
+    let expected = ActionExecutionReceipt {
+        run_id: claimed.action().run_id.clone(),
+        action_id: claimed.action().id.clone(),
+        parameter_hash: claimed.action().parameter_hash().clone(),
+    };
+    let (receipt, recovered) = executor.execute(claimed)?.into_receipt();
+    if receipt != expected {
+        return Err(invalid_receipt());
+    }
+    if !store.reconcile_action_execution(&receipt, AuditAppend::new(actor, timestamp))? {
+        return Err(OpenWorkError::new(
+            ErrorCode::ApprovalInvalid,
+            if recovered {
+                "executed action was already reconciled"
+            } else {
+                "executor performed an action with an existing audit receipt"
+            },
+        ));
+    }
     Ok(receipt)
 }
 
@@ -120,7 +155,7 @@ where
 /// executors must use a durable idempotency record before external side effects.
 #[derive(Default)]
 pub struct MockActionExecutor {
-    executed: Mutex<BTreeSet<ActionId>>,
+    receipts: Mutex<BTreeMap<ActionId, ActionExecutionReceipt>>,
 }
 
 impl MockActionExecutor {
@@ -131,29 +166,44 @@ impl MockActionExecutor {
     /// Returns an internal error if the executor state lock is poisoned.
     pub fn was_executed(&self, action_id: &ActionId) -> Result<bool, OpenWorkError> {
         Ok(self
-            .executed
+            .receipts
             .lock()
             .map_err(|_| executor_state_error())?
-            .contains(action_id))
+            .contains_key(action_id))
+    }
+
+    /// Returns the number of side effects this mock accepted as newly performed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error if the executor state lock is poisoned.
+    pub fn execution_count(&self) -> Result<usize, OpenWorkError> {
+        Ok(self
+            .receipts
+            .lock()
+            .map_err(|_| executor_state_error())?
+            .len())
     }
 }
 
 impl ActionExecutor for MockActionExecutor {
-    fn execute(&self, claimed: ClaimedAction) -> Result<ActionExecutionReceipt, OpenWorkError> {
+    fn execute(&self, claimed: ClaimedAction) -> Result<ActionExecutionOutcome, OpenWorkError> {
         let action = claimed.action();
-        let mut executed = self.executed.lock().map_err(|_| executor_state_error())?;
-        if !executed.insert(action.id.clone()) {
-            return Err(OpenWorkError::new(
-                ErrorCode::ApprovalInvalid,
-                "consumed action claim was already executed",
-            ));
+        let mut receipts = self.receipts.lock().map_err(|_| executor_state_error())?;
+        if let Some(receipt) = receipts.get(&action.id) {
+            if receipt.run_id != action.run_id || receipt.parameter_hash != *action.parameter_hash()
+            {
+                return Err(invalid_receipt());
+            }
+            return Ok(ActionExecutionOutcome::Recovered(receipt.clone()));
         }
-
-        Ok(ActionExecutionReceipt {
+        let receipt = ActionExecutionReceipt {
             run_id: action.run_id.clone(),
             action_id: action.id.clone(),
             parameter_hash: claimed.claim().parameter_hash.clone(),
-        })
+        };
+        receipts.insert(action.id.clone(), receipt.clone());
+        Ok(ActionExecutionOutcome::Performed(receipt))
     }
 }
 
@@ -161,6 +211,13 @@ fn invalid_claim() -> OpenWorkError {
     OpenWorkError::new(
         ErrorCode::ApprovalInvalid,
         "action does not match an exact consumed approval claim",
+    )
+}
+
+fn invalid_receipt() -> OpenWorkError {
+    OpenWorkError::new(
+        ErrorCode::ApprovalInvalid,
+        "action execution receipt is missing, duplicated, or does not match the exact claim",
     )
 }
 

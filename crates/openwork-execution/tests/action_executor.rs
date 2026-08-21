@@ -1,14 +1,20 @@
-use openwork_core::ErrorCode;
-use openwork_execution::action_executor::{ActionExecutor, ClaimedAction, MockActionExecutor};
+use openwork_core::{ErrorCode, OpenWorkError};
+use openwork_execution::action_executor::{
+    ActionExecutionOutcome, ActionExecutor, ClaimedAction, MockActionExecutor, execute_with_audit,
+};
 use openwork_execution::approval::{ActionClaim, ApprovalRepository};
 use openwork_execution::audit::AuditAppend;
 use openwork_execution::store::{ExecutionStore, InMemoryExecutionStore};
 use openwork_execution::{
     ActionId, ActionRequest, ActorId, ApprovalDecision, ApprovalId, ApprovalRequest,
-    ApprovalStatus, EXECUTION_SCHEMA_VERSION, Run, RunId, RunStatus, UtcTimestamp, sha256_bytes,
+    ApprovalStatus, Artifact, AuditEvent, AuditEventType, EXECUTION_SCHEMA_VERSION, Run, RunId,
+    RunStatus, UtcTimestamp, sha256_bytes,
 };
 use serde_json::json;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 #[test]
 fn consumed_claim_allows_exact_action_once() {
@@ -27,15 +33,122 @@ fn consumed_claim_allows_exact_action_once() {
     )
     .expect("durable claim remains exact");
 
-    let receipt = executor.execute(first).expect("first execution");
+    let ActionExecutionOutcome::Performed(receipt) =
+        executor.execute(first).expect("first execution")
+    else {
+        panic!("first execution must perform the action");
+    };
 
     assert_eq!(&receipt.run_id, &fixture.action.run_id);
     assert_eq!(&receipt.action_id, &fixture.action.id);
     assert_eq!(&receipt.parameter_hash, fixture.action.parameter_hash());
     assert!(executor.was_executed(&fixture.action.id).expect("state"));
+    let ActionExecutionOutcome::Recovered(recovered) =
+        executor.execute(replay).expect("replay recovers receipt")
+    else {
+        panic!("replay must not perform the action again");
+    };
+    assert_eq!(recovered, receipt);
+    assert_eq!(executor.execution_count().expect("count"), 1);
+}
+
+#[test]
+fn transient_audit_failure_is_reconciled_without_repeating_side_effect() {
+    let fixture = approved_fixture();
+    let store = FailOnceActionAuditStore::new(fixture.store);
+    let executor = MockActionExecutor::default();
+    let first = claimed(&store.inner, &fixture.action, &fixture.claim);
+
+    let error = execute_with_audit(
+        &store,
+        &executor,
+        first,
+        actor(),
+        timestamp("2026-08-10T00:00:06Z"),
+    )
+    .expect_err("first audit append fails after the side effect");
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert_eq!(executor.execution_count().expect("count"), 1);
+    assert_eq!(action_executed_count(&store, &fixture.action.run_id), 0);
+
+    let receipt = execute_with_audit(
+        &store,
+        &executor,
+        claimed(&store.inner, &fixture.action, &fixture.claim),
+        actor(),
+        timestamp("2026-08-10T00:00:07Z"),
+    )
+    .expect("retry recovers the durable receipt and repairs the audit");
+    assert_eq!(&receipt.action_id, &fixture.action.id);
+    assert_eq!(executor.execution_count().expect("count"), 1);
+    assert_eq!(action_executed_count(&store, &fixture.action.run_id), 1);
+
+    let replay = execute_with_audit(
+        &store,
+        &executor,
+        claimed(&store.inner, &fixture.action, &fixture.claim),
+        actor(),
+        timestamp("2026-08-10T00:00:08Z"),
+    )
+    .expect_err("a reconciled action remains replay protected");
+    assert_eq!(replay.code, ErrorCode::ApprovalInvalid);
+    assert_eq!(executor.execution_count().expect("count"), 1);
+    assert_eq!(action_executed_count(&store, &fixture.action.run_id), 1);
+}
+
+#[test]
+fn concurrent_reconciliation_appends_exactly_one_action_audit() {
+    let fixture = approved_fixture();
+    let store = Arc::new(FailOnceActionAuditStore::new(fixture.store));
+    let executor = Arc::new(MockActionExecutor::default());
+    let first = claimed(&store.inner, &fixture.action, &fixture.claim);
+    execute_with_audit(
+        store.as_ref(),
+        executor.as_ref(),
+        first,
+        actor(),
+        timestamp("2026-08-10T00:00:06Z"),
+    )
+    .expect_err("establish performed receipt with missing audit");
+
+    let barrier = Arc::new(Barrier::new(2));
+    let mut workers = Vec::new();
+    for retry in [
+        claimed(&store.inner, &fixture.action, &fixture.claim),
+        claimed(&store.inner, &fixture.action, &fixture.claim),
+    ] {
+        let worker_store = Arc::clone(&store);
+        let worker_executor = Arc::clone(&executor);
+        let worker_barrier = Arc::clone(&barrier);
+        workers.push(thread::spawn(move || {
+            worker_barrier.wait();
+            execute_with_audit(
+                worker_store.as_ref(),
+                worker_executor.as_ref(),
+                retry,
+                actor(),
+                timestamp("2026-08-10T00:00:07Z"),
+            )
+        }));
+    }
+    let results = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("reconciliation worker"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
     assert_eq!(
-        executor.execute(replay).expect_err("replay rejected").code,
-        ErrorCode::ApprovalInvalid
+        results
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .filter(|error| error.code == ErrorCode::ApprovalInvalid)
+            .count(),
+        1
+    );
+    assert_eq!(executor.execution_count().expect("count"), 1);
+    assert_eq!(
+        action_executed_count(store.as_ref(), &fixture.action.run_id),
+        1
     );
 }
 
@@ -131,6 +244,99 @@ fn expired_approval_cannot_produce_executable_action() {
             .expect("claim read")
             .is_none()
     );
+}
+
+struct FailOnceActionAuditStore {
+    inner: InMemoryExecutionStore,
+    fail_next_action_audit: AtomicBool,
+}
+
+impl FailOnceActionAuditStore {
+    fn new(inner: InMemoryExecutionStore) -> Self {
+        Self {
+            inner,
+            fail_next_action_audit: AtomicBool::new(true),
+        }
+    }
+}
+
+impl ExecutionStore for FailOnceActionAuditStore {
+    fn create_run(&self, run: Run, audit: AuditAppend) -> Result<Run, OpenWorkError> {
+        self.inner.create_run(run, audit)
+    }
+
+    fn transition_run(
+        &self,
+        run_id: &RunId,
+        expected_revision: u64,
+        next: RunStatus,
+        reason: Option<&str>,
+        audit: AuditAppend,
+    ) -> Result<Run, OpenWorkError> {
+        self.inner
+            .transition_run(run_id, expected_revision, next, reason, audit)
+    }
+
+    fn append_audit(
+        &self,
+        run_id: &RunId,
+        event_type: AuditEventType,
+        audit: AuditAppend,
+    ) -> Result<AuditEvent, OpenWorkError> {
+        self.inner.append_audit(run_id, event_type, audit)
+    }
+
+    fn reconcile_action_execution(
+        &self,
+        receipt: &openwork_execution::action_executor::ActionExecutionReceipt,
+        audit: AuditAppend,
+    ) -> Result<bool, OpenWorkError> {
+        if self.fail_next_action_audit.swap(false, Ordering::AcqRel) {
+            return Err(OpenWorkError::new(
+                ErrorCode::Internal,
+                "simulated transient action audit failure",
+            ));
+        }
+        self.inner.reconcile_action_execution(receipt, audit)
+    }
+
+    fn record_artifacts(
+        &self,
+        run_id: &RunId,
+        artifacts: Vec<Artifact>,
+        audit: AuditAppend,
+    ) -> Result<(), OpenWorkError> {
+        self.inner.record_artifacts(run_id, artifacts, audit)
+    }
+
+    fn get_run(&self, run_id: &RunId) -> Result<Option<Run>, OpenWorkError> {
+        self.inner.get_run(run_id)
+    }
+
+    fn audit_events(&self, run_id: &RunId) -> Result<Vec<AuditEvent>, OpenWorkError> {
+        self.inner.audit_events(run_id)
+    }
+
+    fn artifacts(&self, run_id: &RunId) -> Result<Vec<Artifact>, OpenWorkError> {
+        self.inner.artifacts(run_id)
+    }
+}
+
+fn claimed(
+    store: &InMemoryExecutionStore,
+    action: &ActionRequest,
+    claim: &ActionClaim,
+) -> ClaimedAction {
+    ClaimedAction::verify(store, action.clone(), claim.clone()).expect("exact durable claim")
+}
+
+fn action_executed_count(store: &impl ExecutionStore, run_id: &RunId) -> usize {
+    store
+        .audit_events(run_id)
+        .expect("audit events")
+        .iter()
+        .filter(|event| event.event_type == AuditEventType::ActionExecuted)
+        .count()
 }
 
 struct PendingFixture {

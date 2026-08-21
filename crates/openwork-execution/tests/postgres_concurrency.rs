@@ -1,5 +1,6 @@
 #![cfg(feature = "postgres")]
 
+use openwork_execution::action_executor::ActionExecutionReceipt;
 use openwork_execution::approval::ApprovalRepository;
 use openwork_execution::audit::AuditAppend;
 use openwork_execution::store::ExecutionStore;
@@ -18,6 +19,51 @@ use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 
 const MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 static DATABASE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[test]
+fn postgres_boundary_normalizes_precision_before_hashing_and_round_trips() {
+    let _database_guard = database_test_guard();
+    let Some(store) = postgres_store() else {
+        return;
+    };
+    let exact = timestamp("2026-08-21T01:00:00.123456789Z");
+    let run = Run {
+        schema_version: EXECUTION_SCHEMA_VERSION,
+        id: RunId::generate(),
+        runtime: "mock".to_owned(),
+        workspace: PathBuf::from("/tmp/openwork-postgres-precision-test"),
+        status: RunStatus::Queued,
+        revision: 0,
+        actor_id: actor(),
+        prompt_sha256: sha256_bytes(b"postgres precision test"),
+        created_at: exact,
+        updated_at: exact,
+        started_at: None,
+        completed_at: None,
+        terminal_reason: None,
+    };
+
+    let created = store
+        .create_run(run, AuditAppend::new(actor(), exact))
+        .expect("create precise run");
+    assert_eq!(exact.unix_timestamp_nanos() % 1_000, 789);
+    assert_eq!(created.created_at.unix_timestamp_nanos() % 1_000, 0);
+    assert_eq!(created.updated_at, created.created_at);
+
+    let stored = store
+        .get_run(&created.id)
+        .expect("read run")
+        .expect("stored run");
+    assert_eq!(stored.created_at, created.created_at);
+    let audit = store
+        .audit_events(&created.id)
+        .expect("verified audit chain");
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].timestamp, created.created_at);
+    audit[0]
+        .verify_integrity(1, None)
+        .expect("Postgres audit hash round-trip");
+}
 
 #[test]
 fn postgres_approve_vs_deny_has_one_cas_winner() {
@@ -142,6 +188,76 @@ fn postgres_consume_vs_consume_creates_one_claim() {
             AuditAppend::new(actor(), timestamp("2026-08-21T01:00:06Z")),
         )
         .expect("finish consumed run");
+}
+
+#[test]
+fn postgres_action_audit_reconciliation_is_atomic() {
+    let _database_guard = database_test_guard();
+    let Some(fixture) = approved_approval_fixture() else {
+        return;
+    };
+    let consumption = fixture
+        .store
+        .consume_approval(
+            &fixture.approval.id,
+            fixture.approval.revision,
+            &fixture.action,
+            actor(),
+            timestamp("2026-08-21T01:00:05Z"),
+        )
+        .expect("consume action approval");
+    let receipt = ActionExecutionReceipt {
+        run_id: fixture.action.run_id.clone(),
+        action_id: fixture.action.id.clone(),
+        parameter_hash: consumption.action_claim.parameter_hash,
+    };
+    let barrier = Arc::new(Barrier::new(2));
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let worker_store = fixture.store.clone();
+        let worker_receipt = receipt.clone();
+        let worker_barrier = Arc::clone(&barrier);
+        workers.push(std::thread::spawn(move || {
+            worker_barrier.wait();
+            worker_store.reconcile_action_execution(
+                &worker_receipt,
+                AuditAppend::new(actor(), timestamp("2026-08-21T01:00:06Z")),
+            )
+        }));
+    }
+    let mut outcomes = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("reconciliation thread"))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("atomic reconciliation outcomes");
+    outcomes.sort_unstable();
+    assert_eq!(outcomes, vec![false, true]);
+    let events = fixture
+        .store
+        .audit_events(&fixture.action.run_id)
+        .expect("action audit events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == AuditEventType::ActionExecuted)
+            .count(),
+        1
+    );
+    let running = fixture
+        .store
+        .get_run(&fixture.action.run_id)
+        .expect("read running run")
+        .expect("running run");
+    fixture
+        .store
+        .transition_run(
+            &running.id,
+            running.revision,
+            RunStatus::Succeeded,
+            None,
+            AuditAppend::new(actor(), timestamp("2026-08-21T01:00:07Z")),
+        )
+        .expect("finish reconciled run");
 }
 
 #[test]

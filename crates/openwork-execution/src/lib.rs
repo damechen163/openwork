@@ -115,7 +115,7 @@ pub struct UtcTimestamp(OffsetDateTime);
 impl UtcTimestamp {
     #[must_use]
     pub fn now() -> Self {
-        Self::from_offset_datetime(OffsetDateTime::now_utc())
+        Self(OffsetDateTime::now_utc())
     }
 
     #[allow(clippy::missing_errors_doc)]
@@ -128,19 +128,7 @@ impl UtcTimestamp {
         }
         let parsed = OffsetDateTime::parse(&value, &Rfc3339)
             .map_err(|_| invalid_contract("timestamp must be RFC 3339 UTC with a Z suffix"))?;
-        Ok(Self::from_offset_datetime(parsed))
-    }
-
-    fn from_offset_datetime(value: OffsetDateTime) -> Self {
-        // PostgreSQL stores timestamptz at microsecond precision. Canonicalize
-        // every public timestamp at the contract boundary so persisted audit
-        // events reconstruct the exact bytes that were originally hashed.
-        let microsecond_nanoseconds = (value.nanosecond() / 1_000) * 1_000;
-        Self(
-            value
-                .replace_nanosecond(microsecond_nanoseconds)
-                .expect("a truncated nanosecond is always in range"),
-        )
+        Ok(Self(parsed))
     }
 
     #[must_use]
@@ -1882,14 +1870,14 @@ mod tests {
     }
 
     #[test]
-    fn timestamps_use_postgres_safe_microsecond_precision() {
+    fn timestamps_preserve_frozen_v1_nanosecond_precision() {
         let timestamp =
             UtcTimestamp::parse("2026-08-21T15:04:10.123456789Z").expect("valid timestamp");
 
-        assert_eq!(timestamp.unix_timestamp_nanos() % 1_000, 0);
+        assert_eq!(timestamp.unix_timestamp_nanos() % 1_000, 789);
         assert_eq!(
             serde_json::to_string(&timestamp).expect("serialize timestamp"),
-            "\"2026-08-21T15:04:10.123456Z\""
+            "\"2026-08-21T15:04:10.123456789Z\""
         );
     }
 
@@ -2284,6 +2272,41 @@ mod tests {
         let mut tampered = serde_json::to_value(event).expect("serialize event");
         tampered["metadata"]["reason_code"] = json!("changed");
         assert!(serde_json::from_value::<AuditEvent>(tampered).is_err());
+    }
+
+    #[test]
+    fn frozen_v1_nanosecond_audit_hash_round_trips() {
+        let timestamp =
+            UtcTimestamp::parse("2026-08-10T00:00:00.123456789Z").expect("nanosecond time");
+        let metadata = RedactedAuditMetadata::from_untrusted(&BTreeMap::from([(
+            "reason_code".to_owned(),
+            json!("created"),
+        )]));
+        let event = AuditEvent::new(
+            AuditEventId::parse("01890f3e-a5f1-7cc2-98c0-5f9c6f5e7a04").expect("UUIDv7"),
+            run_id(),
+            1,
+            AuditEventType::RunCreated,
+            ActorId::parse("system:control-api").expect("actor"),
+            timestamp,
+            metadata,
+            None,
+        )
+        .expect("audit event");
+
+        assert_eq!(
+            event.event_hash().as_str(),
+            "265fc73ee15b6161ed0010379066d5a81e3f6a3199e6cdea5715cf92c8de8e84"
+        );
+        let encoded = serde_json::to_value(&event).expect("serialize audit event");
+        assert_eq!(
+            encoded["timestamp"],
+            json!("2026-08-10T00:00:00.123456789Z")
+        );
+        let decoded = serde_json::from_value::<AuditEvent>(encoded).expect("round-trip event");
+        assert_eq!(decoded.timestamp, timestamp);
+        assert_eq!(decoded.event_hash(), event.event_hash());
+        decoded.verify_integrity(1, None).expect("valid hash");
     }
 
     #[test]

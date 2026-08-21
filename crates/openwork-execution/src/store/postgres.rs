@@ -10,6 +10,7 @@
 //! work through a runtime-aware adapter so they may be called from synchronous,
 //! current-thread Tokio, or multi-thread Tokio contexts.
 
+use crate::action_executor::ActionExecutionReceipt;
 use crate::approval::{ActionClaim, ApprovalConsumption, ApprovalRepository};
 use crate::audit::AuditAppend;
 use crate::{
@@ -34,6 +35,47 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct PostgresExecutionStore {
     pool: PgPool,
+}
+
+/// Postgres `timestamptz` stores microseconds. Keep the frozen public v1
+/// timestamp contract lossless and normalize only objects crossing this store
+/// boundary, before timestamp-dependent audit hashes are constructed.
+fn postgres_timestamp(timestamp: UtcTimestamp) -> UtcTimestamp {
+    let microsecond_nanoseconds = (timestamp.0.nanosecond() / 1_000) * 1_000;
+    UtcTimestamp(
+        timestamp
+            .0
+            .replace_nanosecond(microsecond_nanoseconds)
+            .expect("a truncated nanosecond is always in range"),
+    )
+}
+
+fn postgres_run(mut run: Run) -> Run {
+    run.created_at = postgres_timestamp(run.created_at);
+    run.updated_at = postgres_timestamp(run.updated_at);
+    run.started_at = run.started_at.map(postgres_timestamp);
+    run.completed_at = run.completed_at.map(postgres_timestamp);
+    run
+}
+
+fn postgres_artifact(mut artifact: Artifact) -> Artifact {
+    artifact.created_at = postgres_timestamp(artifact.created_at);
+    artifact
+}
+
+fn postgres_approval(mut approval: ApprovalRequest) -> ApprovalRequest {
+    approval.created_at = postgres_timestamp(approval.created_at);
+    approval.expires_at = postgres_timestamp(approval.expires_at);
+    approval.consumed_at = approval.consumed_at.map(postgres_timestamp);
+    if let Some(decision) = &mut approval.decision {
+        decision.decided_at = postgres_timestamp(decision.decided_at);
+    }
+    approval
+}
+
+fn postgres_audit(mut audit: AuditAppend) -> AuditAppend {
+    audit.timestamp = postgres_timestamp(audit.timestamp);
+    audit
 }
 
 /// Stable, non-sensitive reason persisted for runs interrupted by a control
@@ -72,6 +114,7 @@ impl PostgresExecutionStore {
         trusted_actor: ActorId,
         trusted_now: UtcTimestamp,
     ) -> Result<RecoveryReport, OpenWorkError> {
+        let trusted_now = postgres_timestamp(trusted_now);
         let pool = self.pool.clone();
         block_on(async move {
             let mut tx = pool.begin().await.map_err(internal_db)?;
@@ -137,6 +180,8 @@ impl super::ExecutionStore for PostgresExecutionStore {
                 "genesis audit timestamp must match run creation",
             ));
         }
+        let run = postgres_run(run);
+        let audit = postgres_audit(audit);
         let event = audit.build(run.id.clone(), 1, AuditEventType::RunCreated, None)?;
         let pool = self.pool.clone();
         block_on(async move {
@@ -158,6 +203,7 @@ impl super::ExecutionStore for PostgresExecutionStore {
     ) -> Result<Run, OpenWorkError> {
         let run_id = run_id.clone();
         let reason = reason.map(String::from);
+        let audit = postgres_audit(audit);
         let pool = self.pool.clone();
         block_on(async move {
             let mut tx = pool.begin().await.map_err(internal_db)?;
@@ -199,6 +245,7 @@ impl super::ExecutionStore for PostgresExecutionStore {
         audit: AuditAppend,
     ) -> Result<AuditEvent, OpenWorkError> {
         let run_id = run_id.clone();
+        let audit = postgres_audit(audit);
         let pool = self.pool.clone();
         block_on(async move {
             let mut tx = pool.begin().await.map_err(internal_db)?;
@@ -216,12 +263,106 @@ impl super::ExecutionStore for PostgresExecutionStore {
         })
     }
 
+    fn reconcile_action_execution(
+        &self,
+        receipt: &ActionExecutionReceipt,
+        audit: AuditAppend,
+    ) -> Result<bool, OpenWorkError> {
+        let receipt = receipt.clone();
+        let audit = postgres_audit(audit);
+        let pool = self.pool.clone();
+        block_on(async move {
+            let mut tx = pool.begin().await.map_err(internal_db)?;
+            let _run = lock_run_tx(&mut tx, &receipt.run_id).await?;
+            let claim = sqlx::query(
+                "SELECT run_id, parameter_hash::text
+                 FROM action_claims WHERE action_id = $1",
+            )
+            .bind(receipt.action_id.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(internal_db)?
+            .ok_or_else(|| approval_err("action execution has no durable claim"))?;
+            if claim.get::<Uuid, _>("run_id") != receipt.run_id.0
+                || claim.get::<String, _>("parameter_hash") != receipt.parameter_hash.as_str()
+            {
+                return Err(approval_err(
+                    "action execution receipt does not match its durable claim",
+                ));
+            }
+
+            let rows = sqlx::query(
+                "SELECT redacted_metadata
+                 FROM audit_events
+                 WHERE run_id = $1 AND event_type = 'action_executed'",
+            )
+            .bind(receipt.run_id.0)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(internal_db)?;
+            let expected_action_id = receipt.action_id.to_hyphenated();
+            let mut exact_matches = 0_u8;
+            for row in rows {
+                let metadata = row.get::<Value, _>("redacted_metadata");
+                let action_id = metadata
+                    .get("action_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| approval_err("action execution audit metadata is invalid"))?;
+                let parameter_hash = metadata
+                    .get("parameter_hash")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| approval_err("action execution audit metadata is invalid"))?;
+                if action_id == expected_action_id {
+                    if parameter_hash != receipt.parameter_hash.as_str() {
+                        return Err(approval_err("action execution audit binding is invalid"));
+                    }
+                    exact_matches = exact_matches
+                        .checked_add(1)
+                        .ok_or_else(|| approval_err("duplicate action execution audit"))?;
+                }
+            }
+            match exact_matches {
+                1 => {
+                    tx.commit().await.map_err(internal_db)?;
+                    return Ok(false);
+                }
+                0 => {}
+                _ => return Err(approval_err("duplicate action execution audit")),
+            }
+
+            let last_audit_ts = last_audit_timestamp_tx(&mut tx, &receipt.run_id).await?;
+            if last_audit_ts.is_some_and(|timestamp| audit.timestamp < timestamp) {
+                return Err(super::state_error(
+                    "action execution audit timestamp moved backwards",
+                ));
+            }
+            let sequence = next_audit_sequence_tx(&mut tx, &receipt.run_id).await?;
+            let previous_hash = last_audit_hash_tx(&mut tx, &receipt.run_id).await?;
+            let event = audit
+                .with_action_execution(receipt.action_id.clone(), receipt.parameter_hash.clone())
+                .build(
+                    receipt.run_id,
+                    sequence,
+                    AuditEventType::ActionExecuted,
+                    previous_hash,
+                )?;
+            insert_audit_event_tx(&mut tx, &event).await?;
+            tx.commit().await.map_err(internal_db)?;
+            Ok(true)
+        })
+    }
+
     fn record_artifacts(
         &self,
         run_id: &RunId,
         artifacts: Vec<Artifact>,
         audit: AuditAppend,
     ) -> Result<(), OpenWorkError> {
+        let artifacts = artifacts
+            .into_iter()
+            .map(postgres_artifact)
+            .collect::<Vec<_>>();
+        let audit = postgres_audit(audit);
         if artifacts.iter().any(|a| &a.run_id != run_id) {
             return Err(OpenWorkError::new(
                 ErrorCode::ArtifactInvalid,
@@ -381,6 +522,9 @@ impl ApprovalRepository for PostgresExecutionStore {
         {
             return Err(approval_err("new approval invariants are invalid"));
         }
+        request.validate()?;
+        let trusted_now = postgres_timestamp(trusted_now);
+        request = postgres_approval(request);
         request.request_reason = redact_text(&request.request_reason);
         request.validate()?;
 
@@ -464,6 +608,7 @@ impl ApprovalRepository for PostgresExecutionStore {
         if reason.is_some_and(|value| value.len() > 2048) {
             return Err(approval_err("approval decision reason is too long"));
         }
+        let trusted_now = postgres_timestamp(trusted_now);
         let approval_id = approval_id.clone();
         let reason = reason.map(String::from);
         let pool = self.pool.clone();
@@ -555,6 +700,7 @@ impl ApprovalRepository for PostgresExecutionStore {
         trusted_actor: ActorId,
         trusted_now: UtcTimestamp,
     ) -> Result<ApprovalRequest, OpenWorkError> {
+        let trusted_now = postgres_timestamp(trusted_now);
         let approval_id = approval_id.clone();
         let pool = self.pool.clone();
         block_on(async move {
@@ -617,6 +763,7 @@ impl ApprovalRepository for PostgresExecutionStore {
         trusted_actor: ActorId,
         trusted_now: UtcTimestamp,
     ) -> Result<ApprovalConsumption, OpenWorkError> {
+        let trusted_now = postgres_timestamp(trusted_now);
         let approval_id = approval_id.clone();
         let action = action.clone();
         let pool = self.pool.clone();
@@ -934,6 +1081,11 @@ async fn insert_audit_event_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     event: &AuditEvent,
 ) -> Result<(), OpenWorkError> {
+    if event.timestamp != postgres_timestamp(event.timestamp) {
+        return Err(super::internal_error(
+            "audit timestamp was not normalized for Postgres",
+        ));
+    }
     let metadata_value = serde_json::to_value(event.metadata.as_map())
         .map_err(|_| super::internal_error("serialize metadata"))?;
     sqlx::query(
@@ -1437,6 +1589,20 @@ mod tests {
 
         assert!(verify_audit_chain(&[first.clone(), second.clone()]).is_ok());
         assert!(verify_audit_chain(&[second, first]).is_err());
+    }
+
+    #[test]
+    fn timestamp_precision_is_normalized_only_at_postgres_boundary() {
+        let exact =
+            UtcTimestamp::parse("2026-08-21T00:00:00.123456789Z").expect("nanosecond timestamp");
+        let normalized = postgres_timestamp(exact);
+
+        assert_eq!(exact.unix_timestamp_nanos() % 1_000, 789);
+        assert_eq!(normalized.unix_timestamp_nanos() % 1_000, 0);
+        assert_eq!(
+            serde_json::to_string(&normalized).expect("serialize timestamp"),
+            "\"2026-08-21T00:00:00.123456Z\""
+        );
     }
 
     #[test]
