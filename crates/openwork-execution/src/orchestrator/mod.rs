@@ -124,7 +124,30 @@ impl<S: ExecutionStore> ExecutionOrchestrator<S> {
         actor: ActorId,
         now: UtcTimestamp,
     ) -> Result<Run, OpenWorkError> {
-        // Transition Queued/Planning → Running
+        if run.id != request.run_id {
+            return Err(OpenWorkError::new(
+                ErrorCode::ExecutionFailed,
+                "sandbox request does not match run",
+            ));
+        }
+
+        // A newly created run is Queued. Record the explicit planning step
+        // before entering Running so the primary execution path obeys the
+        // public state machine without requiring callers to mutate the run.
+        let run = if run.status == RunStatus::Queued {
+            self.transition(
+                &run.id,
+                run.revision,
+                RunStatus::Planning,
+                None,
+                actor.clone(),
+                now,
+            )?
+        } else {
+            run.clone()
+        };
+
+        // Transition Planning → Running.
         let run = self.transition(
             &run.id,
             run.revision,
@@ -135,17 +158,20 @@ impl<S: ExecutionStore> ExecutionOrchestrator<S> {
         )?;
 
         // Execute in sandbox
-        let result = sandbox.execute(request).inspect_err(|_error| {
-            // Best-effort: record the failure as a terminal event.
-            // run.revision is the current revision from the first transition.
-            let _ = self.store.transition_run(
-                &run.id,
-                run.revision,
-                RunStatus::Failed,
-                Some("sandbox execution failed"),
-                audit(actor.clone(), UtcTimestamp::now()),
-            );
-        })?;
+        let result = sandbox
+            .execute(request)
+            .and_then(|result| validate_sandbox_result(&run.id, result))
+            .inspect_err(|_error| {
+                // Best-effort: record the failure as a terminal event.
+                // run.revision is the current revision from the first transition.
+                let _ = self.store.transition_run(
+                    &run.id,
+                    run.revision,
+                    RunStatus::Failed,
+                    Some("sandbox execution failed"),
+                    audit(actor.clone(), UtcTimestamp::now()),
+                );
+            })?;
 
         // Scan output artifacts (only when the container exited cleanly)
         let completed_at = UtcTimestamp::now();
@@ -210,6 +236,26 @@ impl<S: ExecutionStore> ExecutionOrchestrator<S> {
     pub const fn store(&self) -> &S {
         &self.store
     }
+}
+
+fn validate_sandbox_result(
+    run_id: &RunId,
+    result: crate::SandboxResult,
+) -> Result<crate::SandboxResult, OpenWorkError> {
+    result.validate()?;
+    if &result.run_id != run_id {
+        return Err(OpenWorkError::new(
+            ErrorCode::ExecutionFailed,
+            "sandbox result does not match run",
+        ));
+    }
+    if !matches!(result.cleanup, crate::SandboxCleanupStatus::Succeeded) {
+        return Err(OpenWorkError::new(
+            ErrorCode::ExecutionFailed,
+            "sandbox cleanup failed",
+        ));
+    }
+    Ok(result)
 }
 
 fn audit(actor: ActorId, timestamp: UtcTimestamp) -> AuditAppend {

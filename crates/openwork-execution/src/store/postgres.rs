@@ -7,8 +7,8 @@
 //!
 //! All public trait methods are synchronous (matching the [`ExecutionStore`] and
 //! [`ApprovalRepository`] signatures) and internally drive their async database
-//! work via [`tokio::task::block_in_place`] so they may be called from either
-//! sync or async contexts without blocking the async runtime's worker threads.
+//! work through a runtime-aware adapter so they may be called from synchronous,
+//! current-thread Tokio, or multi-thread Tokio contexts.
 
 use crate::approval::{ActionClaim, ApprovalConsumption, ApprovalRepository};
 use crate::audit::AuditAppend;
@@ -255,7 +255,12 @@ impl super::ExecutionStore for PostgresExecutionStore {
             .await
             .map_err(internal_db)
         })?;
-        rows.iter().map(row_to_audit_event).collect()
+        let events: Vec<AuditEvent> = rows
+            .iter()
+            .map(row_to_audit_event)
+            .collect::<Result<_, _>>()?;
+        verify_audit_chain(&events)?;
+        Ok(events)
     }
 
     fn artifacts(&self, run_id: &RunId) -> Result<Vec<Artifact>, OpenWorkError> {
@@ -309,15 +314,11 @@ impl ApprovalRepository for PostgresExecutionStore {
             let exists = sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS(
                     SELECT 1 FROM approval_requests
-                    WHERE (id = $1)
-                       OR (run_id = $2 AND action_id = $3 AND parameter_hash = $4
-                           AND status IN ('pending', 'approved'))
+                    WHERE id = $1 OR action_id = $2
                 )",
             )
             .bind(request.id.0)
-            .bind(request.run_id.0)
             .bind(request.action_id.0)
-            .bind(request.parameter_hash.as_str())
             .fetch_one(&mut *tx)
             .await
             .map_err(internal_db)?;
@@ -347,8 +348,8 @@ impl ApprovalRepository for PostgresExecutionStore {
             sqlx::query(
                 "INSERT INTO approval_requests
                     (id, run_id, action_id, parameter_hash, requested_by, request_reason,
-                     created_at, expires_at, status, revision)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending'::approval_status, 0)",
+                     created_at, expires_at, status, revision, awaiting_run_revision)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending'::approval_status, 0, $9)",
             )
             .bind(request.id.0)
             .bind(request.run_id.0)
@@ -358,6 +359,7 @@ impl ApprovalRepository for PostgresExecutionStore {
             .bind(&request.request_reason)
             .bind(request.created_at.0)
             .bind(request.expires_at.0)
+            .bind(i64::try_from(run.revision).map_err(|_| approval_err("run revision overflow"))?)
             .execute(&mut *tx)
             .await
             .map_err(internal_db)?;
@@ -542,8 +544,9 @@ impl ApprovalRepository for PostgresExecutionStore {
             let mut tx = pool.begin().await.map_err(internal_db)?;
             let current = lock_approval_tx(&mut tx, &approval_id).await?;
             let run = lock_run_tx(&mut tx, &current.run_id).await?;
+            let awaiting_run_revision = approval_window_revision_tx(&mut tx, &current.id).await?;
             let run_revision = run.revision;
-            verify_approval_window_tx_inner(&current, &run)?;
+            verify_approval_window(awaiting_run_revision, &run)?;
 
             if current.status == ApprovalStatus::Approved
                 && current.revision == expected_revision
@@ -953,14 +956,25 @@ async fn verify_approval_window_tx(
     approval: &ApprovalRequest,
 ) -> Result<(), OpenWorkError> {
     let run = lock_run_tx(tx, &approval.run_id).await?;
-    verify_approval_window_tx_inner(approval, &run)
+    let awaiting_run_revision = approval_window_revision_tx(tx, &approval.id).await?;
+    verify_approval_window(awaiting_run_revision, &run)
 }
 
-fn verify_approval_window_tx_inner(
-    _approval: &ApprovalRequest,
-    run: &Run,
-) -> Result<(), OpenWorkError> {
-    if run.status != RunStatus::AwaitingApproval {
+async fn approval_window_revision_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    approval_id: &ApprovalId,
+) -> Result<u64, OpenWorkError> {
+    let revision: i64 =
+        sqlx::query_scalar("SELECT awaiting_run_revision FROM approval_requests WHERE id = $1")
+            .bind(approval_id.0)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(internal_db)?;
+    u64::try_from(revision).map_err(|_| approval_err("awaiting run revision is invalid"))
+}
+
+fn verify_approval_window(awaiting_run_revision: u64, run: &Run) -> Result<(), OpenWorkError> {
+    if run.status != RunStatus::AwaitingApproval || run.revision != awaiting_run_revision {
         return Err(approval_err(
             "approval does not belong to the current awaiting-approval window",
         ));
@@ -1138,6 +1152,19 @@ fn row_to_action_claim(row: &sqlx::postgres::PgRow) -> Result<ActionClaim, OpenW
     })
 }
 
+fn verify_audit_chain(events: &[AuditEvent]) -> Result<(), OpenWorkError> {
+    let mut previous_hash: Option<Sha256Digest> = None;
+    for (index, event) in events.iter().enumerate() {
+        let sequence = u64::try_from(index)
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| super::internal_error("audit sequence overflow"))?;
+        event.verify_integrity(sequence, previous_hash.as_ref())?;
+        previous_hash = Some(event.event_hash().clone());
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // String <-> enum helpers
 // ---------------------------------------------------------------------------
@@ -1243,8 +1270,113 @@ fn is_unique_violation(err: &sqlx::Error) -> bool {
 // Synchronous adapter (for trait methods that are not async)
 // ---------------------------------------------------------------------------
 
-/// Runs a future to completion using [`tokio::task::block_in_place`] so the
-/// calling thread is never blocked inside an async runtime worker.
-fn block_on<F: std::future::Future>(f: F) -> F::Output {
-    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+/// Runs an owned database future from synchronous or Tokio-backed callers.
+/// Multi-thread runtimes can safely use `block_in_place`; a current-thread
+/// runtime delegates to a dedicated thread so its sole executor is not blocked.
+fn block_on<F>(future: F) -> F::Output
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(future))
+        }
+        Ok(_) => std::thread::spawn(move || database_runtime().block_on(future))
+            .join()
+            .expect("database runtime thread panicked"),
+        Err(_) => database_runtime().block_on(future),
+    }
+}
+
+fn database_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("database runtime must initialize")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_window_requires_exact_run_revision() {
+        let now = UtcTimestamp::parse("2026-08-21T00:00:00Z").expect("timestamp");
+        let run = Run {
+            schema_version: EXECUTION_SCHEMA_VERSION,
+            id: RunId::generate(),
+            runtime: "mock".to_owned(),
+            workspace: PathBuf::from("/tmp/openwork-test"),
+            status: RunStatus::AwaitingApproval,
+            revision: 3,
+            actor_id: ActorId::parse("test:actor").expect("actor"),
+            prompt_sha256: Sha256Digest::parse("a".repeat(64)).expect("digest"),
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            completed_at: None,
+            terminal_reason: None,
+        };
+
+        assert!(verify_approval_window(3, &run).is_ok());
+        assert!(verify_approval_window(2, &run).is_err());
+        let mut later_window = run;
+        later_window.revision = 5;
+        assert!(verify_approval_window(3, &later_window).is_err());
+    }
+
+    #[test]
+    fn audit_reads_require_a_complete_hash_chain() {
+        let run_id = RunId::generate();
+        let actor = ActorId::parse("test:auditor").expect("actor");
+        let now = UtcTimestamp::parse("2026-08-21T00:00:00Z").expect("timestamp");
+        let first = AuditEvent::new(
+            AuditEventId::generate(),
+            run_id.clone(),
+            1,
+            AuditEventType::RunCreated,
+            actor.clone(),
+            now,
+            RedactedAuditMetadata::from_untrusted(&BTreeMap::new()),
+            None,
+        )
+        .expect("first event");
+        let second = AuditEvent::new(
+            AuditEventId::generate(),
+            run_id,
+            2,
+            AuditEventType::RuntimeSelected,
+            actor,
+            now,
+            RedactedAuditMetadata::from_untrusted(&BTreeMap::new()),
+            Some(first.event_hash().clone()),
+        )
+        .expect("second event");
+
+        assert!(verify_audit_chain(&[first.clone(), second.clone()]).is_ok());
+        assert!(verify_audit_chain(&[second, first]).is_err());
+    }
+
+    #[test]
+    fn block_on_supports_synchronous_callers() {
+        assert_eq!(block_on(async { 7_u8 }), 7);
+    }
+
+    #[test]
+    fn block_on_supports_current_thread_runtime_callers() {
+        let value = database_runtime().block_on(async { block_on(async { 11_u8 }) });
+        assert_eq!(value, 11);
+    }
+
+    #[test]
+    fn block_on_supports_multi_thread_runtime_callers() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let value = runtime.block_on(async { block_on(async { 13_u8 }) });
+        assert_eq!(value, 13);
+    }
 }

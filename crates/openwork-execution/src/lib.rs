@@ -646,13 +646,28 @@ impl<'de> Deserialize<'de> for DigestPinnedImageRef {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxCommand {
     program: String,
     arguments: Vec<String>,
     environment: BTreeMap<String, String>,
+    #[serde(skip_serializing)]
     stdin: Vec<u8>,
+}
+
+impl std::fmt::Debug for SandboxCommand {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let environment_keys: Vec<&str> = self.environment.keys().map(String::as_str).collect();
+        formatter
+            .debug_struct("SandboxCommand")
+            .field("program", &self.program)
+            .field("arguments", &self.arguments)
+            .field("environment_keys", &environment_keys)
+            .field("stdin", &"<redacted>")
+            .field("stdin_bytes", &self.stdin.len())
+            .finish()
+    }
 }
 
 impl SandboxCommand {
@@ -1382,7 +1397,7 @@ impl<'de> Deserialize<'de> for ApprovalRequest {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeTask {
     pub schema_version: SchemaVersion,
@@ -1393,6 +1408,22 @@ pub struct RuntimeTask {
     pub working_directory: SandboxWorkingDirectory,
     pub timeout_seconds: u64,
     pub capabilities: Vec<String>,
+}
+
+impl std::fmt::Debug for RuntimeTask {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeTask")
+            .field("schema_version", &self.schema_version)
+            .field("run_id", &self.run_id)
+            .field("runtime", &self.runtime)
+            .field("prompt", &"<redacted>")
+            .field("prompt_hash", &self.prompt_hash)
+            .field("working_directory", &self.working_directory)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .field("capabilities", &self.capabilities)
+            .finish()
+    }
 }
 
 impl RuntimeTask {
@@ -1887,6 +1918,27 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn sandbox_command_debug_and_serialization_redact_stdin() {
+        let prompt = "private prompt sentinel";
+        let command = SandboxCommand::with_stdin(
+            "/usr/bin/mock-runtime",
+            vec!["run".to_owned()],
+            BTreeMap::from([("SAFE_SETTING".to_owned(), "private-env-value".to_owned())]),
+            prompt.as_bytes().to_vec(),
+        )
+        .expect("command");
+
+        let debug = format!("{command:?}");
+        assert!(!debug.contains(prompt));
+        assert!(!debug.contains("private-env-value"));
+        assert!(debug.contains("stdin_bytes"));
+
+        let serialized = serde_json::to_value(command).expect("serialize command");
+        assert!(serialized.get("stdin").is_none());
+        assert!(!serialized.to_string().contains(prompt));
     }
 
     #[test]

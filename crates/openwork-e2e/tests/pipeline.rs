@@ -445,18 +445,6 @@ fn pipeline_single_artifact_minimal_chain() {
         .create_run("claude-code", &workspace, actor.clone(), prompt, now)
         .expect("create run");
 
-    // Transition to Planning.
-    let run = orchestrator
-        .transition(
-            &run.id,
-            run.revision,
-            RunStatus::Planning,
-            None,
-            actor.clone(),
-            UtcTimestamp::now(),
-        )
-        .expect("transition to Planning");
-
     let task = openwork_execution::RuntimeTask {
         schema_version: EXECUTION_SCHEMA_VERSION,
         run_id: run.id.clone(),

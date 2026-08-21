@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -21,6 +21,12 @@ enum InspectMode {
     OutOfMemory,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StdinDeliveryMode {
+    Immediate,
+    BlockUntilRelease,
+}
+
 struct FakeDockerCli {
     calls: Mutex<Vec<Vec<String>>>,
     inspect: Mutex<VecDeque<InspectMode>>,
@@ -29,6 +35,10 @@ struct FakeDockerCli {
     output_directory: Mutex<Option<PathBuf>>,
     create_success: bool,
     start_transport_error: bool,
+    stdin_delivery: StdinDeliveryMode,
+    stdin_release: Mutex<bool>,
+    stdin_release_changed: Condvar,
+    captured_stdin: Mutex<Vec<u8>>,
     remove_success: bool,
     logs: Vec<u8>,
 }
@@ -43,6 +53,10 @@ impl FakeDockerCli {
             output_directory: Mutex::new(None),
             create_success: true,
             start_transport_error: false,
+            stdin_delivery: StdinDeliveryMode::Immediate,
+            stdin_release: Mutex::new(false),
+            stdin_release_changed: Condvar::new(),
+            captured_stdin: Mutex::new(Vec::new()),
             remove_success: true,
             logs: b"safe output".to_vec(),
         }
@@ -58,6 +72,26 @@ impl FakeDockerCli {
             .filter_map(|call| call.first().cloned())
             .collect()
     }
+
+    fn release_stdin_delivery(&self) {
+        *self.stdin_release.lock().expect("stdin release lock") = true;
+        self.stdin_release_changed.notify_all();
+    }
+
+    fn wait_for_stdin_release(&self) -> Result<(), OpenWorkError> {
+        let released = self.stdin_release.lock().expect("stdin release lock");
+        let (released, timeout) = self
+            .stdin_release_changed
+            .wait_timeout_while(released, Duration::from_secs(2), |released| !*released)
+            .expect("stdin release wait");
+        if timeout.timed_out() && !*released {
+            return Err(OpenWorkError::new(
+                ErrorCode::ExecutionFailed,
+                "simulated attached stdin remained blocked",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl DockerCli for FakeDockerCli {
@@ -66,13 +100,16 @@ impl DockerCli for FakeDockerCli {
         arguments: &[OsString],
         max_output_bytes: u64,
         _timeout: Duration,
-        _stdin: &[u8],
+        stdin: &[u8],
     ) -> Result<CliOutput, OpenWorkError> {
         let args = arguments
             .iter()
             .map(|value| value.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         self.calls.lock().expect("calls lock").push(args.clone());
+        if !stdin.is_empty() {
+            *self.captured_stdin.lock().expect("captured stdin lock") = stdin.to_vec();
+        }
         match args.first().map(String::as_str) {
             Some("version") => Ok(output(true, b"27.0.0".to_vec(), max_output_bytes)),
             Some("create") => {
@@ -95,11 +132,21 @@ impl DockerCli for FakeDockerCli {
                 "simulated start transport error",
             )),
             Some("start") => {
+                if self.stdin_delivery == StdinDeliveryMode::BlockUntilRelease && !stdin.is_empty()
+                {
+                    self.wait_for_stdin_release()?;
+                }
                 if let Some(output_directory) =
                     self.output_directory.lock().expect("output lock").as_ref()
                 {
                     fs::write(output_directory.join("summary.md"), "survives cleanup")
                         .expect("fake artifact");
+                }
+                Ok(output(true, Vec::new(), max_output_bytes))
+            }
+            Some("attach") => {
+                if self.stdin_delivery == StdinDeliveryMode::BlockUntilRelease {
+                    self.wait_for_stdin_release()?;
                 }
                 Ok(output(true, Vec::new(), max_output_bytes))
             }
@@ -120,7 +167,10 @@ impl DockerCli for FakeDockerCli {
                 Ok(output(true, state.to_vec(), max_output_bytes))
             }
             Some("logs") => Ok(output(true, self.logs.clone(), max_output_bytes)),
-            Some("kill") => Ok(output(true, Vec::new(), max_output_bytes)),
+            Some("kill") => {
+                self.release_stdin_delivery();
+                Ok(output(true, Vec::new(), max_output_bytes))
+            }
             Some("rm") => Ok(output(self.remove_success, Vec::new(), max_output_bytes)),
             _ => panic!("unexpected Docker command: {args:?}"),
         }
@@ -151,6 +201,10 @@ struct Fixture {
 }
 
 fn fixture(timeout_seconds: u64, max_output_bytes: u64) -> Fixture {
+    fixture_with_stdin(timeout_seconds, max_output_bytes, Vec::new())
+}
+
+fn fixture_with_stdin(timeout_seconds: u64, max_output_bytes: u64, stdin: Vec<u8>) -> Fixture {
     let root = tempfile::tempdir().expect("fixture root");
     let input_root = root.path().join("approved-inputs");
     let output_root = root.path().join("approved-outputs");
@@ -167,10 +221,11 @@ fn fixture(timeout_seconds: u64, max_output_bytes: u64) -> Fixture {
             "1".repeat(64)
         ))
         .expect("image"),
-        SandboxCommand::new(
+        SandboxCommand::with_stdin(
             "/usr/bin/mock-runtime",
             vec!["run".to_owned()],
             BTreeMap::from([("EXPLICIT_TOKEN".to_owned(), "secret-value".to_owned())]),
+            stdin,
         )
         .expect("command"),
         SandboxUser::new(65_532, 65_532).expect("user"),
@@ -274,17 +329,27 @@ fn lifecycle_uses_hardened_create_then_id_only_cleanup() {
 }
 
 #[test]
-fn timeout_kills_and_removes_container_without_deleting_output() {
-    let fixture = fixture(1, 1024);
+fn stdin_attachment_does_not_block_timeout_polling() {
+    let prompt = b"provider prompt\n".to_vec();
+    let fixture = fixture_with_stdin(1, 1024, prompt.clone());
     fs::write(fixture.output.join("prior.txt"), "keep").unwrap();
     let mut fake = FakeDockerCli::successful();
     fake.inspect = Mutex::new(VecDeque::from([InspectMode::Running]));
+    fake.stdin_delivery = StdinDeliveryMode::BlockUntilRelease;
     let cli = Arc::new(fake);
     let backend = DockerSandbox::new(Arc::clone(&cli), fixture.temporary)
         .with_poll_interval(Duration::from_millis(2));
     let result = backend.execute(&fixture.request).expect("timeout result");
 
     assert_eq!(result.termination, SandboxTermination::TimedOut);
+    let calls = cli.commands();
+    assert!(calls.iter().any(|call| call == &["start", CONTAINER_ID]));
+    assert!(
+        calls
+            .iter()
+            .any(|call| { call == &["attach", "--sig-proxy=false", CONTAINER_ID] })
+    );
+    assert_eq!(*cli.captured_stdin.lock().unwrap(), prompt);
     assert!(
         cli.command_names()
             .windows(2)
@@ -298,11 +363,13 @@ fn timeout_kills_and_removes_container_without_deleting_output() {
 }
 
 #[test]
-fn cancel_marks_result_and_cleanup_prevents_orphan() {
-    let fixture = fixture(10, 1024);
+fn stdin_attachment_does_not_block_cancel_polling() {
+    let prompt = b"provider prompt\n".to_vec();
+    let fixture = fixture_with_stdin(10, 1024, prompt.clone());
     let run_id = fixture.request.run_id.clone();
     let mut fake = FakeDockerCli::successful();
     fake.inspect = Mutex::new(VecDeque::from([InspectMode::Running]));
+    fake.stdin_delivery = StdinDeliveryMode::BlockUntilRelease;
     let cli = Arc::new(fake);
     let backend = Arc::new(
         DockerSandbox::new(Arc::clone(&cli), fixture.temporary)
@@ -312,15 +379,27 @@ fn cancel_marks_result_and_cleanup_prevents_orphan() {
     let request = fixture.request;
     let handle = thread::spawn(move || executing.execute(&request));
     let deadline = Instant::now() + Duration::from_secs(1);
-    while !cli.command_names().contains(&"inspect".to_owned()) && Instant::now() < deadline {
+    let polling_started = loop {
+        let names = cli.command_names();
+        if names.contains(&"attach".to_owned()) && names.contains(&"inspect".to_owned()) {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
         thread::sleep(Duration::from_millis(2));
-    }
+    };
     backend.cancel(&run_id).expect("cancel active sandbox");
     let result = handle
         .join()
         .expect("execute thread")
         .expect("cancel result");
+    assert!(
+        polling_started,
+        "polling must begin while stdin is attached"
+    );
     assert_eq!(result.termination, SandboxTermination::Cancelled);
+    assert_eq!(*cli.captured_stdin.lock().unwrap(), prompt);
     assert!(cli.command_names().contains(&"rm".to_owned()));
     assert_eq!(
         backend.cancel(&run_id).unwrap_err().code,

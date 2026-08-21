@@ -66,8 +66,10 @@ fn claude_preparation_is_shell_free_ephemeral_and_prompt_private() {
     let invocation = ClaudeTaskAdapter::new("/usr/local/bin/claude")
         .prepare(&task)
         .expect("Claude invocation");
+    let debug = format!("{task:?}\n{invocation:?}");
     let args = arguments(&invocation);
 
+    assert!(!debug.contains(prompt));
     assert_eq!(invocation.command.program(), "/usr/local/bin/claude");
     assert_eq!(invocation.stdin, prompt.as_bytes());
     assert_eq!(invocation.working_directory.as_str(), "/workspace/output");

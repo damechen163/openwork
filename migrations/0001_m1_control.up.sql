@@ -10,12 +10,7 @@ CREATE TYPE approval_status AS ENUM (
 CREATE TABLE runs (
     id UUID PRIMARY KEY,
     runtime TEXT NOT NULL CHECK (length(runtime) BETWEEN 1 AND 128),
-    workspace TEXT NOT NULL CHECK (
-        length(workspace) BETWEEN 1 AND 256
-        AND workspace ~ '^[A-Za-z0-9._/-]+$'
-        AND workspace !~ '^/' AND workspace NOT LIKE '%//%' AND right(workspace, 1) <> '/'
-        AND workspace !~ '(^|/)\\.{1,2}(/|$)'
-    ),
+    workspace TEXT NOT NULL CHECK (length(workspace) BETWEEN 1 AND 4096),
     status run_status NOT NULL DEFAULT 'queued',
     revision BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0),
     actor_id TEXT NOT NULL CHECK (length(actor_id) BETWEEN 1 AND 256 AND btrim(actor_id) <> ''),
@@ -76,7 +71,9 @@ CREATE TABLE approval_requests (
     expires_at TIMESTAMPTZ NOT NULL,
     status approval_status NOT NULL DEFAULT 'pending',
     revision BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0),
+    awaiting_run_revision BIGINT NOT NULL CHECK (awaiting_run_revision >= 0),
     consumed_at TIMESTAMPTZ,
+    UNIQUE (action_id),
     UNIQUE (run_id, action_id, parameter_hash),
     CHECK (expires_at > created_at AND expires_at <= created_at + INTERVAL '24 hours'),
     CHECK ((status = 'consumed' AND consumed_at IS NOT NULL) OR (status <> 'consumed' AND consumed_at IS NULL))

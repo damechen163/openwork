@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -60,31 +61,6 @@ impl<C: DockerCli> DockerSandbox<C> {
         self.cli.run(args, limit, CLI_TIMEOUT, &[])
     }
 
-    fn invoke_with_stdin(
-        &self,
-        args: &[OsString],
-        limit: u64,
-        stdin: &[u8],
-    ) -> Result<CliOutput, OpenWorkError> {
-        self.cli.run(args, limit, CLI_TIMEOUT, stdin)
-    }
-
-    fn start_container(
-        &self,
-        container_id: &str,
-        request: &SandboxRequest,
-    ) -> Result<CliOutput, OpenWorkError> {
-        if request.command.stdin().is_empty() {
-            return self.invoke(&os_args(["start", container_id]), CONTROL_OUTPUT_LIMIT);
-        }
-
-        self.invoke_with_stdin(
-            &os_args(["start", "-a", "-i", container_id]),
-            CONTROL_OUTPUT_LIMIT,
-            request.command.stdin(),
-        )
-    }
-
     fn execute_inner(&self, request: &SandboxRequest) -> Result<SandboxResult, OpenWorkError> {
         validate_mount(request.input_directory.as_path())?;
         validate_mount(request.output_directory.as_path())?;
@@ -115,35 +91,8 @@ impl<C: DockerCli> DockerSandbox<C> {
         let _registration =
             ActiveRegistration::insert(Arc::clone(&self.active), key, Arc::clone(&active))?;
         let started_at = UtcTimestamp::now();
-        let start = self.start_container(&container_id, request)?;
-        let (mut termination, mut exit_code) = (SandboxTermination::Failed, None);
-        if start.success {
-            let deadline = Instant::now() + Duration::from_secs(request.limits.timeout_seconds());
-            loop {
-                if active.cancel_requested.load(Ordering::Acquire) {
-                    termination = SandboxTermination::Cancelled;
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    let _ = self.invoke(&os_args(["kill", &container_id]), CONTROL_OUTPUT_LIMIT);
-                    termination = SandboxTermination::TimedOut;
-                    break;
-                }
-                match self.inspect(&container_id) {
-                    Ok(state) if state.running => thread::sleep(self.poll_interval),
-                    Ok(state) if state.oom_killed => {
-                        termination = SandboxTermination::OutOfMemory;
-                        break;
-                    }
-                    Ok(state) => {
-                        termination = SandboxTermination::Exited;
-                        exit_code = Some(state.exit_code);
-                        break;
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
+        let (mut termination, mut exit_code) =
+            self.run_container(&container_id, &active, request)?;
         let logs = self
             .invoke(
                 &os_args(["logs", &container_id]),
@@ -185,6 +134,43 @@ impl<C: DockerCli> DockerSandbox<C> {
         Ok(result)
     }
 
+    fn run_container(
+        &self,
+        container_id: &str,
+        active: &ActiveContainer,
+        request: &SandboxRequest,
+    ) -> Result<(SandboxTermination, Option<i32>), OpenWorkError> {
+        let start = self.invoke(&os_args(["start", container_id]), CONTROL_OUTPUT_LIMIT)?;
+        if !start.success {
+            return Ok((SandboxTermination::Failed, None));
+        }
+        let deadline = Instant::now() + Duration::from_secs(request.limits.timeout_seconds());
+        if request.command.stdin().is_empty() {
+            return Ok(self.monitor_container(container_id, active, deadline, None));
+        }
+        Ok(thread::scope(|scope| {
+            let (attachment_sender, attachment_receiver) = std::sync::mpsc::sync_channel(1);
+            let attachment_timeout =
+                Duration::from_secs(request.limits.timeout_seconds()).saturating_add(CLI_TIMEOUT);
+            let attachment_arguments = os_args(["attach", "--sig-proxy=false", container_id]);
+            let cli = Arc::clone(&self.cli);
+            let stdin = request.command.stdin();
+            let attachment = scope.spawn(move || {
+                let output = cli.run(
+                    &attachment_arguments,
+                    CONTROL_OUTPUT_LIMIT,
+                    attachment_timeout,
+                    stdin,
+                );
+                let _ = attachment_sender.send(output);
+            });
+            let outcome =
+                self.monitor_container(container_id, active, deadline, Some(&attachment_receiver));
+            let _ = attachment.join();
+            outcome
+        }))
+    }
+
     fn inspect(&self, container_id: &str) -> Result<ContainerState, OpenWorkError> {
         let output = self.invoke(
             &os_args(["inspect", "--format", "{{json .State}}", container_id]),
@@ -210,6 +196,50 @@ impl<C: DockerCli> DockerSandbox<C> {
                     sandbox_error(ErrorCode::ExecutionFailed, "Docker state omitted exit code")
                 })?,
         })
+    }
+
+    fn monitor_container(
+        &self,
+        container_id: &str,
+        active: &ActiveContainer,
+        deadline: Instant,
+        attachment: Option<&Receiver<Result<CliOutput, OpenWorkError>>>,
+    ) -> (SandboxTermination, Option<i32>) {
+        let mut attachment_failed = false;
+        loop {
+            if active.cancel_requested.load(Ordering::Acquire) {
+                let _ = self.invoke(&os_args(["kill", container_id]), CONTROL_OUTPUT_LIMIT);
+                return (SandboxTermination::Cancelled, None);
+            }
+            if Instant::now() >= deadline {
+                let _ = self.invoke(&os_args(["kill", container_id]), CONTROL_OUTPUT_LIMIT);
+                return (SandboxTermination::TimedOut, None);
+            }
+            if let Some(attachment) = attachment {
+                match attachment.try_recv() {
+                    Ok(Ok(output)) => attachment_failed |= !output.success,
+                    Ok(Err(_)) | Err(TryRecvError::Disconnected) => attachment_failed = true,
+                    Err(TryRecvError::Empty) => {}
+                }
+            }
+            match self.inspect(container_id) {
+                Ok(state) if state.running && attachment_failed => {
+                    let _ = self.invoke(&os_args(["kill", container_id]), CONTROL_OUTPUT_LIMIT);
+                    return (SandboxTermination::Failed, None);
+                }
+                Ok(state) if state.running => thread::sleep(self.poll_interval),
+                Ok(state) if state.oom_killed => {
+                    return (SandboxTermination::OutOfMemory, None);
+                }
+                Ok(state) => {
+                    return (SandboxTermination::Exited, Some(state.exit_code));
+                }
+                Err(_) => {
+                    let _ = self.invoke(&os_args(["kill", container_id]), CONTROL_OUTPUT_LIMIT);
+                    return (SandboxTermination::Failed, None);
+                }
+            }
+        }
     }
 }
 

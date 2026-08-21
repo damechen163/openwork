@@ -38,12 +38,25 @@ pub enum RuntimeOutputProtocol {
 }
 
 /// Prepared provider invocation. The prompt is kept off argv and supplied via stdin.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct RuntimeInvocation {
     pub command: SandboxCommand,
     pub working_directory: SandboxWorkingDirectory,
     pub stdin: Vec<u8>,
     pub output_protocol: RuntimeOutputProtocol,
+}
+
+impl std::fmt::Debug for RuntimeInvocation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeInvocation")
+            .field("command", &self.command)
+            .field("working_directory", &self.working_directory)
+            .field("stdin", &"<redacted>")
+            .field("stdin_bytes", &self.stdin.len())
+            .field("output_protocol", &self.output_protocol)
+            .finish()
+    }
 }
 
 /// Converts a prepared provider invocation into a bounded sandbox execution request.
