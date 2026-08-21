@@ -1,0 +1,3 @@
+# The analyzer is hashed byte-for-byte and executed in a Linux container.
+# Keep its checked-out bytes stable on Windows hosts with core.autocrlf enabled.
+*.awk text eol=lf
