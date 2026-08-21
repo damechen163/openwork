@@ -43,7 +43,9 @@ services:
       interval: 5s
       timeout: 3s
       retries: 12
-    networks: [control]
+    # Keep database traffic on the internal network while a separate ingress
+    # bridge makes the loopback-published HTTP port reachable from the host.
+    networks: [control, ingress]
     read_only: true
     tmpfs: ["/tmp:rw,noexec,nosuid,size=16m"]
     cap_drop: [ALL]
@@ -65,6 +67,7 @@ services:
 networks:
   control:
     internal: true
+  ingress:
   gateway-egress:
 
 volumes:
