@@ -66,6 +66,7 @@ pub fn run_loop(
     token: &CancellationToken,
     plan: &RunPlan,
     on_run_id: &dyn Fn(&RunId),
+    on_progress: &dyn Fn(&str),
 ) -> Result<RunReport, OpenWorkError> {
     let actor = ActorId::parse(RUN_ACTOR)?;
 
@@ -135,6 +136,7 @@ pub fn run_loop(
         &run,
         &actor,
         &workspace,
+        on_progress,
     );
     drop(cancel_guard);
 
@@ -195,7 +197,9 @@ fn execute_phases(
     run: &Run,
     actor: &ActorId,
     workspace: &Path,
+    on_progress: &dyn Fn(&str),
 ) -> Result<(), RunFailure> {
+    on_progress("runtime phase: agent writes the analysis script");
     scaffold_claude_settings(workspace);
 
     let events = runtime
@@ -263,6 +267,7 @@ fn execute_phases(
     )
     .map_err(|error| RunFailure::Failed(format!("sandbox request rejected: {error}")))?;
 
+    on_progress("sandbox phase: podman runs the script (no network, read-only)");
     let result = backend
         .execute(&request)
         .map_err(|error| RunFailure::Failed(format!("sandbox execution failed: {error}")))?;
@@ -314,6 +319,7 @@ fn execute_phases(
         )));
     }
 
+    on_progress("recording phase: hashing artifacts and appending the audit chain");
     let artifacts = orchestrator
         .record_artifacts(
             &run.id,

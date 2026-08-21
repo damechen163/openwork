@@ -189,6 +189,7 @@ fn happy_path_records_artifacts_and_succeeds() {
         &CancellationToken::new(),
         &plan,
         &|_| {},
+        &|_| {},
     )
     .expect("run must succeed");
 
@@ -234,6 +235,7 @@ fn missing_script_fails_the_run() {
         &CancellationToken::new(),
         &plan,
         &register,
+        &|_| {},
     )
     .expect("run must complete");
 
@@ -266,6 +268,7 @@ fn sandbox_nonzero_exit_fails_the_run() {
         &CancellationToken::new(),
         &plan,
         &|_| {},
+        &|_| {},
     )
     .expect("run must complete");
 
@@ -289,6 +292,7 @@ fn sandbox_timeout_marks_the_run_timed_out() {
         &CancellationToken::new(),
         &plan,
         &|_| {},
+        &|_| {},
     )
     .expect("run must complete");
 
@@ -311,6 +315,7 @@ fn pre_cancelled_token_cancels_the_run() {
         backend.as_ref(),
         &token,
         &plan,
+        &|_| {},
         &|_| {},
     )
     .expect("run must complete");
