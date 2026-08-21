@@ -2,6 +2,8 @@
 
 > 设计记录：M1 "Safe Execution" 里程碑（`openwork run` 真实 AI 任务闭环）
 > 与 `apps/admin-web` Electron 图形界面。状态：**已实现并经真机验证**。
+> 过程工程日志（决策时间线、逐日记录）见
+> [safe-execution-retrospective](../safe-execution-retrospective.md)。
 
 ## 1. 目标与背景
 
