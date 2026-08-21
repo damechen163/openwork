@@ -9,8 +9,9 @@ pub use codex::{CODEX_REQUIRED_FLAGS, CODEX_RUNTIME_ID, CodexTaskAdapter, CodexT
 use openwork_core::{ErrorCode, OpenWorkError, redact_json, redact_text};
 use openwork_execution::{
     ApprovedMountDirectory, DigestPinnedImageRef, EXECUTION_SCHEMA_VERSION, RedactedAuditMetadata,
-    RunId, RuntimeEvent, RuntimeEventPayload, RuntimeTask, SandboxCommand, SandboxLimits,
-    SandboxRequest, SandboxUser, SandboxWorkingDirectory, UtcTimestamp,
+    RunId, RuntimeEvent, RuntimeEventPayload, RuntimeTask, SandboxCleanupStatus, SandboxCommand,
+    SandboxLimits, SandboxRequest, SandboxResult, SandboxTermination, SandboxUser,
+    SandboxWorkingDirectory, UtcTimestamp,
 };
 use serde::Deserializer;
 use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
@@ -135,6 +136,148 @@ pub trait RuntimeEventDecoder: Send {
     /// Rejects an exhausted event budget. Returns `None` after a provider
     /// failure has already made the stream terminal.
     fn finish(&mut self, exit_code: i32) -> Result<Option<RuntimeEvent>, OpenWorkError>;
+}
+
+/// Decodes one validated sandbox result into bounded, unified runtime events.
+///
+/// Stdout is treated as provider JSONL and stderr as independent text lines.
+/// The captured streams cannot preserve their original interleaving, so stdout
+/// records are decoded before stderr records. Only an `Exited` result may call
+/// [`RuntimeEventDecoder::finish`], and it does so with the sandbox-observed
+/// exit code. Cancellation, timeout, out-of-memory, and backend failure remain
+/// execution-layer terminal states and never synthesize provider completion.
+///
+/// This function deliberately returns events to the caller without persisting
+/// either raw output or decoded events. Callers may use it directly as the
+/// output processor for `ExecutionOrchestrator::execute_with_output_processor`:
+///
+/// ```text
+/// |result| decode_sandbox_result(result, decoder.as_mut()).map(|_| ())
+/// ```
+///
+/// # Errors
+///
+/// Fails closed when the result is invalid or truncated, a line is malformed,
+/// duplicated, empty, or oversized, the event budget is exhausted, output
+/// arrives after a decoder terminal event, or decoder finalization fails.
+pub fn decode_sandbox_result(
+    result: &SandboxResult,
+    decoder: &mut dyn RuntimeEventDecoder,
+) -> Result<Vec<RuntimeEvent>, OpenWorkError> {
+    result.validate()?;
+    if !matches!(result.cleanup, SandboxCleanupStatus::Succeeded) {
+        return Err(runtime_error("sandbox cleanup failed"));
+    }
+    if result.truncated {
+        return Err(runtime_error("sandbox output was truncated"));
+    }
+
+    let mut events = Vec::new();
+    decode_lines(&result.stdout, |line| {
+        for event in decoder.decode_stdout_line(line)? {
+            append_decoded_event(result, &mut events, event, DecodedEventSource::Stdout)?;
+        }
+        Ok(())
+    })?;
+    decode_lines(&result.stderr, |line| {
+        let event = decoder.decode_stderr_line(line)?;
+        append_decoded_event(result, &mut events, event, DecodedEventSource::Stderr)?;
+        Ok(())
+    })?;
+
+    if result.termination == SandboxTermination::Exited {
+        let exit_code = result
+            .exit_code
+            .ok_or_else(|| runtime_error("exited sandbox omitted its exit code"))?;
+        if let Some(event) = decoder.finish(exit_code)? {
+            append_decoded_event(result, &mut events, event, DecodedEventSource::Finish)?;
+        } else if !events.last().is_some_and(is_terminal_event) {
+            return Err(runtime_error(
+                "runtime decoder omitted its terminal exit event",
+            ));
+        }
+    }
+    Ok(events)
+}
+
+#[derive(Clone, Copy)]
+enum DecodedEventSource {
+    Stdout,
+    Stderr,
+    Finish,
+}
+
+fn append_decoded_event(
+    result: &SandboxResult,
+    events: &mut Vec<RuntimeEvent>,
+    event: RuntimeEvent,
+    source: DecodedEventSource,
+) -> Result<(), OpenWorkError> {
+    if events.last().is_some_and(is_terminal_event) {
+        return Err(runtime_error(
+            "runtime decoder emitted data after termination",
+        ));
+    }
+    let expected_sequence = u64::try_from(events.len())
+        .ok()
+        .and_then(|sequence| sequence.checked_add(1))
+        .ok_or_else(|| runtime_error("runtime event sequence overflowed"))?;
+    if event.schema_version != EXECUTION_SCHEMA_VERSION
+        || event.run_id != result.run_id
+        || event.sequence != expected_sequence
+        || event.sequence > MAX_RUNTIME_EVENTS
+    {
+        return Err(runtime_error(
+            "runtime decoder emitted an invalid event envelope",
+        ));
+    }
+    ensure_event_bounds(&event.payload, &event.vendor_metadata)?;
+
+    let source_valid = match source {
+        DecodedEventSource::Stdout => !matches!(
+            &event.payload,
+            RuntimeEventPayload::Completed { .. } | RuntimeEventPayload::Cancelled
+        ),
+        DecodedEventSource::Stderr => {
+            matches!(&event.payload, RuntimeEventPayload::Stderr { .. })
+        }
+        DecodedEventSource::Finish => match (&event.payload, result.exit_code) {
+            (RuntimeEventPayload::Completed { exit_code }, Some(observed)) => {
+                observed == 0 && *exit_code == observed
+            }
+            (RuntimeEventPayload::Failed { .. }, Some(observed)) => observed != 0,
+            _ => false,
+        },
+    };
+    if !source_valid {
+        return Err(runtime_error(
+            "runtime decoder emitted an event from an invalid source",
+        ));
+    }
+    events.push(event);
+    Ok(())
+}
+
+const fn is_terminal_event(event: &RuntimeEvent) -> bool {
+    matches!(
+        &event.payload,
+        RuntimeEventPayload::Completed { .. }
+            | RuntimeEventPayload::Failed { .. }
+            | RuntimeEventPayload::Cancelled
+    )
+}
+
+fn decode_lines(
+    output: &str,
+    mut decode: impl FnMut(&[u8]) -> Result<(), OpenWorkError>,
+) -> Result<(), OpenWorkError> {
+    if output.is_empty() {
+        return Ok(());
+    }
+    for line in output.lines() {
+        decode(line.as_bytes())?;
+    }
+    Ok(())
 }
 
 pub(crate) struct EventFactory {
@@ -320,9 +463,35 @@ fn ensure_event_bounds(
     payload: &RuntimeEventPayload,
     metadata: &RedactedAuditMetadata,
 ) -> Result<(), OpenWorkError> {
-    let encoded = serde_json::to_vec(&(payload, metadata))
-        .map_err(|_| runtime_error("runtime event could not be encoded"))?;
-    if encoded.len() > MAX_RUNTIME_EVENT_BYTES {
+    let payload_bytes = match payload {
+        RuntimeEventPayload::Started | RuntimeEventPayload::Cancelled => 0,
+        RuntimeEventPayload::Stdout { chunk, .. } | RuntimeEventPayload::Stderr { chunk, .. } => {
+            chunk.len()
+        }
+        RuntimeEventPayload::Message { content } => content.len(),
+        RuntimeEventPayload::ToolCall { name, parameters } => name
+            .len()
+            .checked_add(
+                serde_json::to_vec(parameters)
+                    .map_err(|_| runtime_error("runtime event could not be bounded"))?
+                    .len(),
+            )
+            .ok_or_else(|| runtime_error("runtime event size overflowed"))?,
+        RuntimeEventPayload::Artifact { relative_path } => relative_path.len(),
+        RuntimeEventPayload::Completed { .. } => std::mem::size_of::<i32>(),
+        RuntimeEventPayload::Failed { code, message } => code
+            .len()
+            .checked_add(message.len())
+            .ok_or_else(|| runtime_error("runtime event size overflowed"))?,
+    };
+    let metadata_bytes = serde_json::to_vec(metadata)
+        .map_err(|_| runtime_error("runtime event metadata could not be bounded"))?
+        .len();
+    let estimated_wire_bytes = payload_bytes
+        .checked_add(metadata_bytes)
+        .and_then(|bytes| bytes.checked_add(512))
+        .ok_or_else(|| runtime_error("runtime event size overflowed"))?;
+    if estimated_wire_bytes > MAX_RUNTIME_EVENT_BYTES {
         return Err(runtime_error("runtime event exceeds the event limit"));
     }
     Ok(())

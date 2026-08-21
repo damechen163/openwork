@@ -36,12 +36,92 @@ pub struct PostgresExecutionStore {
     pool: PgPool,
 }
 
+/// Stable, non-sensitive reason persisted for runs interrupted by a control
+/// plane restart.
+pub const CRASH_RECOVERY_REASON: &str = "control plane restarted during active execution";
+
+/// Result of one deterministic startup-recovery pass.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RecoveryReport {
+    pub recovered_run_ids: Vec<RunId>,
+}
+
 impl PostgresExecutionStore {
     /// Wraps an existing connection pool. The caller is responsible for running
     /// migrations before the store is used.
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Atomically fails runs left in `planning` or `running` by an interrupted
+    /// control-plane process and appends one hash-chained `run_failed` event per
+    /// recovered run.
+    ///
+    /// `queued`, `awaiting_approval`, and terminal runs are intentionally left
+    /// unchanged. M1 has no `cancelling` state, so there is no such state to
+    /// recover. Rows are locked and revision-CAS updated in UUID order; repeated
+    /// calls are idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error and rolls back the entire recovery pass when a database,
+    /// revision, timestamp, or audit-chain invariant fails.
+    pub fn recover_interrupted_runs(
+        &self,
+        trusted_actor: ActorId,
+        trusted_now: UtcTimestamp,
+    ) -> Result<RecoveryReport, OpenWorkError> {
+        let pool = self.pool.clone();
+        block_on(async move {
+            let mut tx = pool.begin().await.map_err(internal_db)?;
+            let rows = sqlx::query(
+                "SELECT id, runtime, workspace, status::text, revision, actor_id,
+                        prompt_sha256::text, created_at, updated_at, started_at,
+                        completed_at, terminal_reason
+                 FROM runs
+                 WHERE status IN ('planning'::run_status, 'running'::run_status)
+                 ORDER BY id
+                 FOR UPDATE",
+            )
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(internal_db)?;
+            let interrupted = rows.iter().map(row_to_run).collect::<Result<Vec<_>, _>>()?;
+            let mut recovered_run_ids = Vec::with_capacity(interrupted.len());
+
+            for current in interrupted {
+                let last_audit_ts = last_audit_timestamp_tx(&mut tx, &current.id).await?;
+                if last_audit_ts.is_some_and(|timestamp| trusted_now < timestamp) {
+                    return Err(super::state_error(
+                        "recovery timestamp cannot move audit time backwards",
+                    ));
+                }
+                let sequence = next_audit_sequence_tx(&mut tx, &current.id).await?;
+                let previous_hash = last_audit_hash_tx(&mut tx, &current.id).await?;
+                let updated = apply_run_transition(
+                    &current,
+                    RunStatus::Failed,
+                    Some(CRASH_RECOVERY_REASON),
+                    trusted_now,
+                )?;
+                let event = AuditAppend::new(trusted_actor.clone(), trusted_now)
+                    .with_run_status(RunStatus::Failed)
+                    .build(
+                        current.id.clone(),
+                        sequence,
+                        AuditEventType::RunFailed,
+                        previous_hash,
+                    )?;
+
+                update_run_tx(&mut tx, &updated, current.revision).await?;
+                insert_audit_event_tx(&mut tx, &event).await?;
+                recovered_run_ids.push(current.id);
+            }
+
+            tx.commit().await.map_err(internal_db)?;
+            Ok(RecoveryReport { recovered_run_ids })
+        })
     }
 }
 
@@ -1230,6 +1310,7 @@ fn parse_audit_event_type(s: &str) -> Result<AuditEventType, OpenWorkError> {
         "approval_denied" => Ok(AuditEventType::ApprovalDenied),
         "approval_expired" => Ok(AuditEventType::ApprovalExpired),
         "approval_consumed" => Ok(AuditEventType::ApprovalConsumed),
+        "action_executed" => Ok(AuditEventType::ActionExecuted),
         "runtime_started" => Ok(AuditEventType::RuntimeStarted),
         "runtime_output" => Ok(AuditEventType::RuntimeOutput),
         "artifact_created" => Ok(AuditEventType::ArtifactCreated),

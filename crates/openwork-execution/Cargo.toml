@@ -18,6 +18,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 jsonschema.workspace = true
+sqlx = { version = "=0.8.6", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio-rustls", "time", "uuid"] }
 tempfile.workspace = true
 
 [features]

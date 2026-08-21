@@ -1,0 +1,498 @@
+#![cfg(feature = "postgres")]
+
+use openwork_execution::approval::ApprovalRepository;
+use openwork_execution::audit::AuditAppend;
+use openwork_execution::store::ExecutionStore;
+use openwork_execution::store::postgres::{CRASH_RECOVERY_REASON, PostgresExecutionStore};
+use openwork_execution::{
+    ActionId, ActionRequest, ActorId, ApprovalDecision, ApprovalId, ApprovalRequest,
+    ApprovalStatus, AuditEventType, EXECUTION_SCHEMA_VERSION, Run, RunId, RunStatus, UtcTimestamp,
+    sha256_bytes,
+};
+use serde_json::json;
+use sqlx::postgres::PgPoolOptions;
+use std::collections::BTreeSet;
+use std::env;
+use std::path::PathBuf;
+use std::sync::{Arc, Barrier, Mutex, MutexGuard};
+
+const MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+static DATABASE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[test]
+fn postgres_approve_vs_deny_has_one_cas_winner() {
+    let _database_guard = database_test_guard();
+    let Some(fixture) = pending_approval_fixture() else {
+        return;
+    };
+    let barrier = Arc::new(Barrier::new(2));
+    let approve_store = fixture.store.clone();
+    let approve_id = fixture.approval.id.clone();
+    let approve_barrier = barrier.clone();
+    let approve = std::thread::spawn(move || {
+        approve_barrier.wait();
+        approve_store.decide_approval(
+            &approve_id,
+            0,
+            ApprovalDecision::Approved,
+            actor(),
+            None,
+            timestamp("2026-08-21T01:00:04Z"),
+        )
+    });
+    let deny_store = fixture.store.clone();
+    let deny_id = fixture.approval.id.clone();
+    let deny = std::thread::spawn(move || {
+        barrier.wait();
+        deny_store.decide_approval(
+            &deny_id,
+            0,
+            ApprovalDecision::Denied,
+            actor(),
+            Some("review decision"),
+            timestamp("2026-08-21T01:00:04Z"),
+        )
+    });
+
+    let results = [
+        approve.join().expect("approve thread"),
+        deny.join().expect("deny thread"),
+    ];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    let stored = fixture
+        .store
+        .get_approval(&fixture.approval.id)
+        .expect("read approval")
+        .expect("stored approval");
+    assert_eq!(stored.revision, 1);
+    assert!(matches!(
+        stored.status,
+        ApprovalStatus::Approved | ApprovalStatus::Denied
+    ));
+}
+
+#[test]
+fn postgres_consume_vs_consume_creates_one_claim() {
+    let _database_guard = database_test_guard();
+    let Some(fixture) = approved_approval_fixture() else {
+        return;
+    };
+    let barrier = Arc::new(Barrier::new(2));
+    let first_store = fixture.store.clone();
+    let first_id = fixture.approval.id.clone();
+    let first_action = fixture.action.clone();
+    let first_barrier = barrier.clone();
+    let first = std::thread::spawn(move || {
+        first_barrier.wait();
+        first_store.consume_approval(
+            &first_id,
+            1,
+            &first_action,
+            actor(),
+            timestamp("2026-08-21T01:00:05Z"),
+        )
+    });
+    let second_store = fixture.store.clone();
+    let second_id = fixture.approval.id.clone();
+    let second_action = fixture.action.clone();
+    let second = std::thread::spawn(move || {
+        barrier.wait();
+        second_store.consume_approval(
+            &second_id,
+            1,
+            &second_action,
+            actor(),
+            timestamp("2026-08-21T01:00:05Z"),
+        )
+    });
+
+    let results = [
+        first.join().expect("first thread"),
+        second.join().expect("second thread"),
+    ];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    let stored = fixture
+        .store
+        .get_approval(&fixture.approval.id)
+        .expect("read approval")
+        .expect("stored approval");
+    assert_eq!(stored.status, ApprovalStatus::Consumed);
+    assert_eq!(stored.revision, 2);
+    assert!(
+        fixture
+            .store
+            .get_action_claim(&fixture.action.id)
+            .expect("read claim")
+            .is_some()
+    );
+    let running = fixture
+        .store
+        .get_run(&fixture.action.run_id)
+        .expect("read consumed run")
+        .expect("consumed run");
+    fixture
+        .store
+        .transition_run(
+            &running.id,
+            running.revision,
+            RunStatus::Succeeded,
+            None,
+            AuditAppend::new(actor(), timestamp("2026-08-21T01:00:06Z")),
+        )
+        .expect("finish consumed run");
+}
+
+#[test]
+fn postgres_cancel_vs_complete_has_one_cas_winner() {
+    let _database_guard = database_test_guard();
+    let Some(store) = postgres_store() else {
+        return;
+    };
+    let run = create_run_in_status(&store, RunStatus::Running);
+    let expected_revision = run.revision;
+    let barrier = Arc::new(Barrier::new(2));
+    let cancel_store = store.clone();
+    let cancel_id = run.id.clone();
+    let cancel_barrier = barrier.clone();
+    let cancel = std::thread::spawn(move || {
+        cancel_barrier.wait();
+        cancel_store.transition_run(
+            &cancel_id,
+            expected_revision,
+            RunStatus::Cancelled,
+            Some("cancelled by test"),
+            AuditAppend::new(actor(), timestamp("2026-08-21T01:00:04Z")),
+        )
+    });
+    let complete_store = store.clone();
+    let complete_id = run.id.clone();
+    let complete = std::thread::spawn(move || {
+        barrier.wait();
+        complete_store.transition_run(
+            &complete_id,
+            expected_revision,
+            RunStatus::Succeeded,
+            None,
+            AuditAppend::new(actor(), timestamp("2026-08-21T01:00:04Z")),
+        )
+    });
+
+    let results = [
+        cancel.join().expect("cancel thread"),
+        complete.join().expect("complete thread"),
+    ];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    let stored = store
+        .get_run(&run.id)
+        .expect("read run")
+        .expect("stored run");
+    assert!(matches!(
+        stored.status,
+        RunStatus::Cancelled | RunStatus::Succeeded
+    ));
+    assert_eq!(stored.revision, run.revision + 1);
+}
+
+#[test]
+fn postgres_revision_race_has_one_transition_winner() {
+    let _database_guard = database_test_guard();
+    let Some(store) = postgres_store() else {
+        return;
+    };
+    let run = create_run_in_status(&store, RunStatus::Planning);
+    let expected_revision = run.revision;
+    let barrier = Arc::new(Barrier::new(2));
+    let awaiting_store = store.clone();
+    let awaiting_id = run.id.clone();
+    let awaiting_barrier = barrier.clone();
+    let awaiting = std::thread::spawn(move || {
+        awaiting_barrier.wait();
+        awaiting_store.transition_run(
+            &awaiting_id,
+            expected_revision,
+            RunStatus::AwaitingApproval,
+            None,
+            AuditAppend::new(actor(), timestamp("2026-08-21T01:00:03Z")),
+        )
+    });
+    let running_store = store.clone();
+    let running_id = run.id.clone();
+    let running = std::thread::spawn(move || {
+        barrier.wait();
+        running_store.transition_run(
+            &running_id,
+            expected_revision,
+            RunStatus::Running,
+            None,
+            AuditAppend::new(actor(), timestamp("2026-08-21T01:00:03Z")),
+        )
+    });
+
+    let results = [
+        awaiting.join().expect("awaiting thread"),
+        running.join().expect("running thread"),
+    ];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    let stored = store
+        .get_run(&run.id)
+        .expect("read run")
+        .expect("stored run");
+    assert!(matches!(
+        stored.status,
+        RunStatus::AwaitingApproval | RunStatus::Running
+    ));
+    assert_eq!(stored.revision, run.revision + 1);
+    store
+        .transition_run(
+            &stored.id,
+            stored.revision,
+            RunStatus::Cancelled,
+            Some("test cleanup"),
+            AuditAppend::new(actor(), timestamp("2026-08-21T01:00:04Z")),
+        )
+        .expect("finish revision-race run");
+}
+
+#[test]
+fn postgres_recovery_is_selective_atomic_and_idempotent() {
+    let _database_guard = database_test_guard();
+    let Some(store) = postgres_store() else {
+        return;
+    };
+    let queued = create_run_in_status(&store, RunStatus::Queued);
+    let planning = create_run_in_status(&store, RunStatus::Planning);
+    let running = create_run_in_status(&store, RunStatus::Running);
+    let awaiting = create_run_in_status(&store, RunStatus::AwaitingApproval);
+    let succeeded = create_run_in_status(&store, RunStatus::Succeeded);
+
+    let report = store
+        .recover_interrupted_runs(actor(), timestamp("2026-08-21T01:00:09Z"))
+        .expect("recover");
+    let recovered = report
+        .recovered_run_ids
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        recovered,
+        BTreeSet::from([planning.id.clone(), running.id.clone()])
+    );
+
+    for interrupted in [&planning, &running] {
+        let stored = store
+            .get_run(&interrupted.id)
+            .expect("read recovered run")
+            .expect("recovered run");
+        assert_eq!(stored.status, RunStatus::Failed);
+        assert_eq!(stored.revision, interrupted.revision + 1);
+        assert_eq!(
+            stored.terminal_reason.as_deref(),
+            Some(CRASH_RECOVERY_REASON)
+        );
+        let events = store.audit_events(&interrupted.id).expect("audit chain");
+        assert_eq!(
+            events.last().expect("recovery event").event_type,
+            AuditEventType::RunFailed
+        );
+    }
+
+    assert_eq!(
+        store
+            .get_run(&queued.id)
+            .expect("queued")
+            .expect("run")
+            .status,
+        RunStatus::Queued
+    );
+    assert_eq!(
+        store
+            .get_run(&awaiting.id)
+            .expect("awaiting")
+            .expect("run")
+            .status,
+        RunStatus::AwaitingApproval
+    );
+    assert_eq!(
+        store
+            .get_run(&succeeded.id)
+            .expect("succeeded")
+            .expect("run")
+            .status,
+        RunStatus::Succeeded
+    );
+    assert!(
+        store
+            .recover_interrupted_runs(actor(), timestamp("2026-08-21T01:00:10Z"))
+            .expect("idempotent recovery")
+            .recovered_run_ids
+            .is_empty()
+    );
+}
+
+struct ApprovalFixture {
+    store: PostgresExecutionStore,
+    action: ActionRequest,
+    approval: ApprovalRequest,
+}
+
+fn approved_approval_fixture() -> Option<ApprovalFixture> {
+    let fixture = pending_approval_fixture()?;
+    let approval = fixture
+        .store
+        .decide_approval(
+            &fixture.approval.id,
+            0,
+            ApprovalDecision::Approved,
+            actor(),
+            None,
+            timestamp("2026-08-21T01:00:04Z"),
+        )
+        .expect("approve fixture");
+    Some(ApprovalFixture {
+        approval,
+        ..fixture
+    })
+}
+
+fn pending_approval_fixture() -> Option<ApprovalFixture> {
+    let store = postgres_store()?;
+    let run = create_run_in_status(&store, RunStatus::AwaitingApproval);
+    let action = ActionRequest::new(
+        ActionId::generate(),
+        run.id.clone(),
+        "email.send",
+        "sales-manager@example.invalid",
+        json!({"report": "august"}),
+    )
+    .expect("action");
+    let created_at = timestamp("2026-08-21T01:00:03Z");
+    let approval = ApprovalRequest {
+        schema_version: EXECUTION_SCHEMA_VERSION,
+        id: ApprovalId::generate(),
+        run_id: run.id,
+        action_id: action.id.clone(),
+        parameter_hash: action.parameter_hash().clone(),
+        requested_by: actor(),
+        request_reason: "external side effect".to_owned(),
+        created_at,
+        expires_at: timestamp("2026-08-21T01:10:00Z"),
+        status: ApprovalStatus::Pending,
+        revision: 0,
+        decision: None,
+        consumed_at: None,
+    };
+    let approval = store
+        .create_approval(approval, actor(), created_at)
+        .expect("create approval");
+    Some(ApprovalFixture {
+        store,
+        action,
+        approval,
+    })
+}
+
+fn postgres_store() -> Option<PostgresExecutionStore> {
+    let Ok(database_url) = env::var("OPENWORK_TEST_DATABASE_URL") else {
+        eprintln!("skipping real Postgres test: OPENWORK_TEST_DATABASE_URL is not set");
+        return None;
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let pool = runtime
+        .block_on(async {
+            let pool = PgPoolOptions::new()
+                .max_connections(10)
+                .connect(&database_url)
+                .await
+                .map_err(|error| error.to_string())?;
+            MIGRATIONS
+                .run(&pool)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>(pool)
+        })
+        .expect("connect and migrate test Postgres");
+    Some(PostgresExecutionStore::new(pool))
+}
+
+fn database_test_guard() -> MutexGuard<'static, ()> {
+    DATABASE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn create_run_in_status(store: &PostgresExecutionStore, target: RunStatus) -> Run {
+    let created_at = timestamp("2026-08-21T01:00:00Z");
+    let run = Run {
+        schema_version: EXECUTION_SCHEMA_VERSION,
+        id: RunId::generate(),
+        runtime: "mock".to_owned(),
+        workspace: PathBuf::from("/tmp/openwork-postgres-test"),
+        status: RunStatus::Queued,
+        revision: 0,
+        actor_id: actor(),
+        prompt_sha256: sha256_bytes(b"postgres concurrency test"),
+        created_at,
+        updated_at: created_at,
+        started_at: None,
+        completed_at: None,
+        terminal_reason: None,
+    };
+    let mut current = store
+        .create_run(run, AuditAppend::new(actor(), created_at))
+        .expect("create run");
+    if target == RunStatus::Queued {
+        return current;
+    }
+    current = store
+        .transition_run(
+            &current.id,
+            current.revision,
+            RunStatus::Planning,
+            None,
+            AuditAppend::new(actor(), timestamp("2026-08-21T01:00:01Z")),
+        )
+        .expect("planning");
+    if target == RunStatus::Planning {
+        return current;
+    }
+    let next = if target == RunStatus::AwaitingApproval {
+        RunStatus::AwaitingApproval
+    } else {
+        RunStatus::Running
+    };
+    current = store
+        .transition_run(
+            &current.id,
+            current.revision,
+            next,
+            None,
+            AuditAppend::new(actor(), timestamp("2026-08-21T01:00:02Z")),
+        )
+        .expect("second transition");
+    if target == RunStatus::Succeeded {
+        current = store
+            .transition_run(
+                &current.id,
+                current.revision,
+                RunStatus::Succeeded,
+                None,
+                AuditAppend::new(actor(), timestamp("2026-08-21T01:00:03Z")),
+            )
+            .expect("succeeded");
+    }
+    current
+}
+
+fn actor() -> ActorId {
+    ActorId::parse("service:postgres-test").expect("actor")
+}
+
+fn timestamp(value: &str) -> UtcTimestamp {
+    UtcTimestamp::parse(value).expect("timestamp")
+}

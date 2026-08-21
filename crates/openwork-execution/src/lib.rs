@@ -1,5 +1,6 @@
 //! Frozen M1 contracts for safe task execution.
 
+pub mod action_executor;
 pub mod approval;
 pub mod artifact;
 pub mod audit;
@@ -114,7 +115,7 @@ pub struct UtcTimestamp(OffsetDateTime);
 impl UtcTimestamp {
     #[must_use]
     pub fn now() -> Self {
-        Self(OffsetDateTime::now_utc())
+        Self::from_offset_datetime(OffsetDateTime::now_utc())
     }
 
     #[allow(clippy::missing_errors_doc)]
@@ -127,7 +128,19 @@ impl UtcTimestamp {
         }
         let parsed = OffsetDateTime::parse(&value, &Rfc3339)
             .map_err(|_| invalid_contract("timestamp must be RFC 3339 UTC with a Z suffix"))?;
-        Ok(Self(parsed))
+        Ok(Self::from_offset_datetime(parsed))
+    }
+
+    fn from_offset_datetime(value: OffsetDateTime) -> Self {
+        // PostgreSQL stores timestamptz at microsecond precision. Canonicalize
+        // every public timestamp at the contract boundary so persisted audit
+        // events reconstruct the exact bytes that were originally hashed.
+        let microsecond_nanoseconds = (value.nanosecond() / 1_000) * 1_000;
+        Self(
+            value
+                .replace_nanosecond(microsecond_nanoseconds)
+                .expect("a truncated nanosecond is always in range"),
+        )
     }
 
     #[must_use]
@@ -438,6 +451,7 @@ pub enum AuditEventType {
     ApprovalDenied,
     ApprovalExpired,
     ApprovalConsumed,
+    ActionExecuted,
     RuntimeStarted,
     RuntimeOutput,
     ArtifactCreated,
@@ -999,8 +1013,7 @@ pub enum SandboxCleanupStatus {
     Failed { error_code: String },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SandboxResult {
     pub schema_version: SchemaVersion,
     pub run_id: RunId,
@@ -1014,6 +1027,28 @@ pub struct SandboxResult {
     pub completed_at: UtcTimestamp,
     pub output_paths: Vec<RelativeArtifactPath>,
     pub cleanup: SandboxCleanupStatus,
+}
+
+impl std::fmt::Debug for SandboxResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SandboxResult")
+            .field("schema_version", &self.schema_version)
+            .field("run_id", &self.run_id)
+            .field("sandbox_id", &self.sandbox_id)
+            .field("termination", &self.termination)
+            .field("exit_code", &self.exit_code)
+            .field("stdout", &"<redacted>")
+            .field("stdout_bytes", &self.stdout.len())
+            .field("stderr", &"<redacted>")
+            .field("stderr_bytes", &self.stderr.len())
+            .field("truncated", &self.truncated)
+            .field("started_at", &self.started_at)
+            .field("completed_at", &self.completed_at)
+            .field("output_paths", &self.output_paths)
+            .field("cleanup", &self.cleanup)
+            .finish()
+    }
 }
 
 #[derive(Deserialize)]
@@ -1397,8 +1432,7 @@ impl<'de> Deserialize<'de> for ApprovalRequest {
     }
 }
 
-#[derive(Clone, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct RuntimeTask {
     pub schema_version: SchemaVersion,
     pub run_id: RunId,
@@ -1494,7 +1528,7 @@ impl<'de> Deserialize<'de> for RuntimeTask {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeEvent {
     pub schema_version: SchemaVersion,
@@ -1505,7 +1539,21 @@ pub struct RuntimeEvent {
     pub vendor_metadata: RedactedAuditMetadata,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+impl std::fmt::Debug for RuntimeEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeEvent")
+            .field("schema_version", &self.schema_version)
+            .field("run_id", &self.run_id)
+            .field("sequence", &self.sequence)
+            .field("timestamp", &self.timestamp)
+            .field("payload_kind", &runtime_event_payload_kind(&self.payload))
+            .field("vendor_metadata", &self.vendor_metadata)
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RuntimeEventPayload {
     Started,
@@ -1537,6 +1585,29 @@ pub enum RuntimeEventPayload {
         message: String,
     },
     Cancelled,
+}
+
+impl std::fmt::Debug for RuntimeEventPayload {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeEventPayload")
+            .field("kind", &runtime_event_payload_kind(self))
+            .finish()
+    }
+}
+
+const fn runtime_event_payload_kind(payload: &RuntimeEventPayload) -> &'static str {
+    match payload {
+        RuntimeEventPayload::Started => "started",
+        RuntimeEventPayload::Stdout { .. } => "stdout",
+        RuntimeEventPayload::Stderr { .. } => "stderr",
+        RuntimeEventPayload::Message { .. } => "message",
+        RuntimeEventPayload::ToolCall { .. } => "tool_call",
+        RuntimeEventPayload::Artifact { .. } => "artifact",
+        RuntimeEventPayload::Completed { .. } => "completed",
+        RuntimeEventPayload::Failed { .. } => "failed",
+        RuntimeEventPayload::Cancelled => "cancelled",
+    }
 }
 
 /// Computes the frozen v1 binding used by policy and approval records.
@@ -1716,6 +1787,7 @@ const fn audit_event_type_name(event_type: AuditEventType) -> &'static str {
         AuditEventType::ApprovalDenied => "approval_denied",
         AuditEventType::ApprovalExpired => "approval_expired",
         AuditEventType::ApprovalConsumed => "approval_consumed",
+        AuditEventType::ActionExecuted => "action_executed",
         AuditEventType::RuntimeStarted => "runtime_started",
         AuditEventType::RuntimeOutput => "runtime_output",
         AuditEventType::ArtifactCreated => "artifact_created",
@@ -1807,6 +1879,18 @@ mod tests {
             "capabilities": []
         }));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn timestamps_use_postgres_safe_microsecond_precision() {
+        let timestamp =
+            UtcTimestamp::parse("2026-08-21T15:04:10.123456789Z").expect("valid timestamp");
+
+        assert_eq!(timestamp.unix_timestamp_nanos() % 1_000, 0);
+        assert_eq!(
+            serde_json::to_string(&timestamp).expect("serialize timestamp"),
+            "\"2026-08-21T15:04:10.123456Z\""
+        );
     }
 
     #[test]
@@ -1939,6 +2023,44 @@ mod tests {
         let serialized = serde_json::to_value(command).expect("serialize command");
         assert!(serialized.get("stdin").is_none());
         assert!(!serialized.to_string().contains(prompt));
+    }
+
+    #[test]
+    fn sensitive_runtime_debug_output_is_content_free() {
+        let sentinel = "private prompt and provider output sentinel";
+        let timestamp = UtcTimestamp::parse("2026-08-10T00:00:00Z").expect("timestamp");
+        let task = RuntimeTask {
+            schema_version: EXECUTION_SCHEMA_VERSION,
+            run_id: run_id(),
+            runtime: "mock".to_owned(),
+            prompt: sentinel.to_owned(),
+            prompt_hash: sha256_bytes(sentinel.as_bytes()),
+            working_directory: SandboxWorkingDirectory::parse("/workspace")
+                .expect("working directory"),
+            timeout_seconds: 30,
+            capabilities: Vec::new(),
+        };
+        let result = SandboxResult {
+            schema_version: EXECUTION_SCHEMA_VERSION,
+            run_id: run_id(),
+            sandbox_id: "sandbox-1".to_owned(),
+            termination: SandboxTermination::Exited,
+            exit_code: Some(0),
+            stdout: sentinel.to_owned(),
+            stderr: sentinel.to_owned(),
+            truncated: false,
+            started_at: timestamp,
+            completed_at: timestamp,
+            output_paths: Vec::new(),
+            cleanup: SandboxCleanupStatus::Succeeded,
+        };
+        let payload = RuntimeEventPayload::Message {
+            content: sentinel.to_owned(),
+        };
+
+        assert!(!format!("{task:?}").contains(sentinel));
+        assert!(!format!("{result:?}").contains(sentinel));
+        assert!(!format!("{payload:?}").contains(sentinel));
     }
 
     #[test]

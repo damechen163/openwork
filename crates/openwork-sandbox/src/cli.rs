@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Bounded result of one Docker CLI invocation.
+/// Bounded result of one container-engine CLI invocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CliOutput {
     pub success: bool,
@@ -19,8 +19,11 @@ pub struct CliOutput {
 }
 
 /// Narrow command boundary used by the production runner and deterministic fakes.
+///
+/// The Docker-oriented name is retained for source compatibility; Podman adapters use the same
+/// shell-free, bounded process contract.
 pub trait DockerCli: Send + Sync {
-    /// Runs Docker without a shell and retains at most `max_output_bytes` in total.
+    /// Runs a container engine without a shell and retains bounded output.
     ///
     /// When `stdin` is non-empty the command receives it on standard input.
     /// Implementations must bound the write to prevent blocking the child process.
@@ -42,6 +45,7 @@ pub trait DockerCli: Send + Sync {
 pub struct SystemDockerCli {
     executable: PathBuf,
     environment: BTreeMap<OsString, OsString>,
+    program: CliProgram,
 }
 
 impl SystemDockerCli {
@@ -51,15 +55,20 @@ impl SystemDockerCli {
     ///
     /// Rejects relative paths. The executable is intentionally not discovered via `PATH`.
     pub fn new(executable: PathBuf) -> Result<Self, OpenWorkError> {
+        Self::new_for(executable, CliProgram::Docker)
+    }
+
+    fn new_for(executable: PathBuf, program: CliProgram) -> Result<Self, OpenWorkError> {
         if !executable.is_absolute() {
             return Err(sandbox_error(
                 ErrorCode::InvalidArguments,
-                "Docker executable must be an absolute path",
+                program.absolute_path_error(),
             ));
         }
         Ok(Self {
             executable,
             environment: BTreeMap::new(),
+            program,
         })
     }
 
@@ -70,6 +79,46 @@ impl SystemDockerCli {
     pub fn with_cli_environment(mut self, key: OsString, value: OsString) -> Self {
         self.environment.insert(key, value);
         self
+    }
+}
+
+/// Podman CLI process runner with the same shell-free and bounded-pipe behavior as Docker.
+#[derive(Clone, Debug)]
+pub struct SystemPodmanCli {
+    inner: SystemDockerCli,
+}
+
+impl SystemPodmanCli {
+    /// Creates a runner for an absolute Podman executable path.
+    ///
+    /// # Errors
+    ///
+    /// Rejects relative paths. The executable is intentionally not discovered via `PATH`.
+    pub fn new(executable: PathBuf) -> Result<Self, OpenWorkError> {
+        Ok(Self {
+            inner: SystemDockerCli::new_for(executable, CliProgram::Podman)?,
+        })
+    }
+
+    /// Adds an explicit non-secret environment value needed by a Podman transport.
+    ///
+    /// Values are never forwarded into the task container.
+    #[must_use]
+    pub fn with_cli_environment(mut self, key: OsString, value: OsString) -> Self {
+        self.inner.environment.insert(key, value);
+        self
+    }
+}
+
+impl DockerCli for SystemPodmanCli {
+    fn run(
+        &self,
+        arguments: &[OsString],
+        max_output_bytes: u64,
+        timeout: Duration,
+        stdin: &[u8],
+    ) -> Result<CliOutput, OpenWorkError> {
+        self.inner.run(arguments, max_output_bytes, timeout, stdin)
     }
 }
 
@@ -95,7 +144,7 @@ impl DockerCli for SystemDockerCli {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|_| {
-                sandbox_error(ErrorCode::SandboxUnavailable, "Docker CLI could not start")
+                sandbox_error(ErrorCode::SandboxUnavailable, self.program.start_error())
             })?;
 
         // Write stdin in a background thread so the child doesn't block on a full pipe.
@@ -117,7 +166,7 @@ impl DockerCli for SystemDockerCli {
             let _ = child.wait();
             return Err(sandbox_error(
                 ErrorCode::Internal,
-                "Docker output pipes were unavailable",
+                "Container engine output pipes were unavailable",
             ));
         };
         let budget = Arc::new(Mutex::new(CaptureBudget::new(max_output_bytes)));
@@ -135,7 +184,7 @@ impl DockerCli for SystemDockerCli {
                     let _ = join_reader(stderr_reader);
                     return Err(sandbox_error(
                         ErrorCode::ExecutionFailed,
-                        "Docker CLI status failed",
+                        self.program.status_error(),
                     ));
                 }
             }
@@ -146,7 +195,7 @@ impl DockerCli for SystemDockerCli {
                 let _ = join_reader(stderr_reader);
                 return Err(sandbox_error(
                     ErrorCode::RunTimedOut,
-                    "Docker CLI invocation timed out",
+                    self.program.timeout_error(),
                 ));
             }
             thread::sleep(Duration::from_millis(10));
@@ -160,6 +209,42 @@ impl DockerCli for SystemDockerCli {
             stderr,
             truncated,
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CliProgram {
+    Docker,
+    Podman,
+}
+
+impl CliProgram {
+    const fn absolute_path_error(self) -> &'static str {
+        match self {
+            Self::Docker => "Docker executable must be an absolute path",
+            Self::Podman => "Podman executable must be an absolute path",
+        }
+    }
+
+    const fn start_error(self) -> &'static str {
+        match self {
+            Self::Docker => "Docker CLI could not start",
+            Self::Podman => "Podman CLI could not start",
+        }
+    }
+
+    const fn status_error(self) -> &'static str {
+        match self {
+            Self::Docker => "Docker CLI status failed",
+            Self::Podman => "Podman CLI status failed",
+        }
+    }
+
+    const fn timeout_error(self) -> &'static str {
+        match self {
+            Self::Docker => "Docker CLI invocation timed out",
+            Self::Podman => "Podman CLI invocation timed out",
+        }
     }
 }
 
@@ -205,6 +290,6 @@ fn spawn_reader<R: Read + Send + 'static>(
 fn join_reader(handle: thread::JoinHandle<io::Result<Vec<u8>>>) -> Result<Vec<u8>, OpenWorkError> {
     handle
         .join()
-        .map_err(|_| sandbox_error(ErrorCode::Internal, "Docker output reader panicked"))?
-        .map_err(|_| sandbox_error(ErrorCode::Io, "Docker output could not be read"))
+        .map_err(|_| sandbox_error(ErrorCode::Internal, "Container output reader panicked"))?
+        .map_err(|_| sandbox_error(ErrorCode::Io, "Container output could not be read"))
 }
