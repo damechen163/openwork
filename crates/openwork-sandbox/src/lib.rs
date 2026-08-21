@@ -69,6 +69,22 @@ impl<C: DockerCli> DockerSandbox<C> {
         self.cli.run(args, limit, CLI_TIMEOUT, stdin)
     }
 
+    fn start_container(
+        &self,
+        container_id: &str,
+        request: &SandboxRequest,
+    ) -> Result<CliOutput, OpenWorkError> {
+        if request.command.stdin().is_empty() {
+            return self.invoke(&os_args(["start", container_id]), CONTROL_OUTPUT_LIMIT);
+        }
+
+        self.invoke_with_stdin(
+            &os_args(["start", "-a", "-i", container_id]),
+            CONTROL_OUTPUT_LIMIT,
+            request.command.stdin(),
+        )
+    }
+
     fn execute_inner(&self, request: &SandboxRequest) -> Result<SandboxResult, OpenWorkError> {
         validate_mount(request.input_directory.as_path())?;
         validate_mount(request.output_directory.as_path())?;
@@ -99,21 +115,7 @@ impl<C: DockerCli> DockerSandbox<C> {
         let _registration =
             ActiveRegistration::insert(Arc::clone(&self.active), key, Arc::clone(&active))?;
         let started_at = UtcTimestamp::now();
-        let has_stdin = !request.command.stdin().is_empty();
-        let start_args: Vec<OsString> = if has_stdin {
-            os_args(["start", "-a", "-i", &container_id])
-        } else {
-            os_args(["start", &container_id])
-        };
-        let start = if has_stdin {
-            self.invoke_with_stdin(
-                &start_args,
-                CONTROL_OUTPUT_LIMIT,
-                request.command.stdin(),
-            )
-        } else {
-            self.invoke(&start_args, CONTROL_OUTPUT_LIMIT)
-        }?;
+        let start = self.start_container(&container_id, request)?;
         let (mut termination, mut exit_code) = (SandboxTermination::Failed, None);
         if start.success {
             let deadline = Instant::now() + Duration::from_secs(request.limits.timeout_seconds());

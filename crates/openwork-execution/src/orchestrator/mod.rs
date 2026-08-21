@@ -135,7 +135,7 @@ impl<S: ExecutionStore> ExecutionOrchestrator<S> {
         )?;
 
         // Execute in sandbox
-        let result = sandbox.execute(request).map_err(|error| {
+        let result = sandbox.execute(request).inspect_err(|_error| {
             // Best-effort: record the failure as a terminal event.
             // run.revision is the current revision from the first transition.
             let _ = self.store.transition_run(
@@ -145,15 +145,11 @@ impl<S: ExecutionStore> ExecutionOrchestrator<S> {
                 Some("sandbox execution failed"),
                 audit(actor.clone(), UtcTimestamp::now()),
             );
-            error
         })?;
 
         // Scan output artifacts (only when the container exited cleanly)
         let completed_at = UtcTimestamp::now();
-        let exited_clean = matches!(
-            result.termination,
-            crate::SandboxTermination::Exited
-        );
+        let exited_clean = matches!(result.termination, crate::SandboxTermination::Exited);
         let _artifacts = if exited_clean {
             match self.record_artifacts(
                 &run.id,
@@ -187,22 +183,16 @@ impl<S: ExecutionStore> ExecutionOrchestrator<S> {
                 RunStatus::Failed,
                 Some("provider exited with non-zero code"),
             ),
-            crate::SandboxTermination::Cancelled => (
-                RunStatus::Cancelled,
-                Some("sandbox was cancelled"),
-            ),
-            crate::SandboxTermination::TimedOut => (
-                RunStatus::TimedOut,
-                Some("sandbox timed out"),
-            ),
-            crate::SandboxTermination::OutOfMemory => (
-                RunStatus::Failed,
-                Some("sandbox out of memory"),
-            ),
-            crate::SandboxTermination::Failed => (
-                RunStatus::Failed,
-                Some("sandbox execution failed"),
-            ),
+            crate::SandboxTermination::Cancelled => {
+                (RunStatus::Cancelled, Some("sandbox was cancelled"))
+            }
+            crate::SandboxTermination::TimedOut => (RunStatus::TimedOut, Some("sandbox timed out")),
+            crate::SandboxTermination::OutOfMemory => {
+                (RunStatus::Failed, Some("sandbox out of memory"))
+            }
+            crate::SandboxTermination::Failed => {
+                (RunStatus::Failed, Some("sandbox execution failed"))
+            }
         };
 
         let reason_str: Option<&str> = reason;

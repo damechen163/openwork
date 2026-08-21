@@ -6,6 +6,10 @@ use openwork_config::{
 };
 use openwork_core::{ErrorCode, OpenWorkError, PRODUCT_NAME};
 use openwork_doctor::{CheckStatus, DoctorReport, inspect_platform};
+use openwork_execution::artifact::ArtifactScanner;
+use openwork_execution::orchestrator::ExecutionOrchestrator;
+use openwork_execution::store::InMemoryExecutionStore;
+use openwork_execution::{ActorId, RunStatus, UtcTimestamp};
 use openwork_installer::{
     ExecutionMode, InstallExecutionFailure, InstallExecutionReport, InstallExecutor, InstallPlan,
     StepResult, StepStatus, dry_run_plan, managed_runtime_plan,
@@ -16,12 +20,6 @@ use openwork_runtime::{
     RuntimeDetection, RuntimeId, RuntimeInstallPlan, RuntimeMetadata, RuntimeRegistry,
     SystemCommandRunner, SystemDownloader,
 };
-use openwork_execution::{
-    ActorId, RunStatus, UtcTimestamp,
-};
-use openwork_execution::artifact::ArtifactScanner;
-use openwork_execution::orchestrator::ExecutionOrchestrator;
-use openwork_execution::store::InMemoryExecutionStore;
 use serde::Serialize;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -548,11 +546,7 @@ fn resolved_runtime_entry(
     ))
 }
 
-fn execute_run(
-    runtime: &str,
-    workspace: &str,
-    prompt: &str,
-) -> Result<u8, (OpenWorkError, bool)> {
+fn execute_run(runtime: &str, workspace: &str, prompt: &str) -> Result<u8, (OpenWorkError, bool)> {
     use std::path::Path;
 
     let actor = ActorId::parse("cli-user").map_err(|e| (e, false))?;

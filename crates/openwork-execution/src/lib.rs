@@ -743,7 +743,9 @@ impl<'de> Deserialize<'de> for SandboxCommand {
         D: Deserializer<'de>,
     {
         let wire = SandboxCommandWire::deserialize(deserializer)?;
-        let stdin = wire.stdin.map_or_else(Vec::new, |s| s.into_bytes());
+        let stdin = wire
+            .stdin
+            .map_or_else(Vec::new, std::string::String::into_bytes);
         Self::with_stdin(wire.program, wire.arguments, wire.environment, stdin)
             .map_err(serde::de::Error::custom)
     }

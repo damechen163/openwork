@@ -98,11 +98,13 @@ impl super::ExecutionStore for PostgresExecutionStore {
             let sequence = next_audit_sequence_tx(&mut tx, &run_id).await?;
             let event_type = super::transition_event(next);
             let audit_ts = audit.timestamp;
-            let event = audit
-                .with_run_status(next)
-                .build(run_id.clone(), sequence, event_type, last_hash)?;
-            let updated =
-                apply_run_transition(&current, next, reason.as_deref(), audit_ts)?;
+            let event = audit.with_run_status(next).build(
+                run_id.clone(),
+                sequence,
+                event_type,
+                last_hash,
+            )?;
+            let updated = apply_run_transition(&current, next, reason.as_deref(), audit_ts)?;
             update_run_tx(&mut tx, &updated, expected_revision).await?;
             insert_audit_event_tx(&mut tx, &event).await?;
             tx.commit().await.map_err(internal_db)?;
@@ -204,15 +206,12 @@ impl super::ExecutionStore for PostgresExecutionStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(internal_db)?;
-                let event = audit
-                    .clone()
-                    .with_artifact(artifact)
-                    .build(
-                        run_id.clone(),
-                        next_seq,
-                        AuditEventType::ArtifactCreated,
-                        prev_hash,
-                    )?;
+                let event = audit.clone().with_artifact(artifact).build(
+                    run_id.clone(),
+                    next_seq,
+                    AuditEventType::ArtifactCreated,
+                    prev_hash,
+                )?;
                 prev_hash = Some(event.event_hash().clone());
                 next_seq = next_seq
                     .checked_add(1)
@@ -426,10 +425,8 @@ impl ApprovalRepository for PostgresExecutionStore {
             )
             .bind(approval_id.0)
             .bind(approval_status_str(updated.status))
-            .bind(i64::try_from(updated.revision)
-                .map_err(|_| approval_err("revision overflow"))?)
-            .bind(i64::try_from(expected_revision)
-                .map_err(|_| approval_err("revision overflow"))?)
+            .bind(i64::try_from(updated.revision).map_err(|_| approval_err("revision overflow"))?)
+            .bind(i64::try_from(expected_revision).map_err(|_| approval_err("revision overflow"))?)
             .execute(&mut *tx)
             .await
             .map_err(internal_db)?;
@@ -451,8 +448,7 @@ impl ApprovalRepository for PostgresExecutionStore {
             .bind(decision_record.actor.as_str())
             .bind(&decision_record.reason)
             .bind(decision_record.decided_at.0)
-            .bind(i64::try_from(updated.revision)
-                .map_err(|_| approval_err("revision overflow"))?)
+            .bind(i64::try_from(updated.revision).map_err(|_| approval_err("revision overflow"))?)
             .execute(&mut *tx)
             .await
             .map_err(internal_db)?;
@@ -461,14 +457,9 @@ impl ApprovalRepository for PostgresExecutionStore {
                 ApprovalDecision::Approved => AuditEventType::ApprovalApproved,
                 ApprovalDecision::Denied => AuditEventType::ApprovalDenied,
             };
-            let event = build_approval_event_tx(
-                &mut tx,
-                &updated,
-                event_type,
-                trusted_actor,
-                trusted_now,
-            )
-            .await?;
+            let event =
+                build_approval_event_tx(&mut tx, &updated, event_type, trusted_actor, trusted_now)
+                    .await?;
             insert_audit_event_tx(&mut tx, &event).await?;
             tx.commit().await.map_err(internal_db)?;
             Ok(updated)
@@ -512,10 +503,8 @@ impl ApprovalRepository for PostgresExecutionStore {
                  WHERE id = $1 AND revision = $3",
             )
             .bind(approval_id.0)
-            .bind(i64::try_from(updated.revision)
-                .map_err(|_| approval_err("revision overflow"))?)
-            .bind(i64::try_from(expected_revision)
-                .map_err(|_| approval_err("revision overflow"))?)
+            .bind(i64::try_from(updated.revision).map_err(|_| approval_err("revision overflow"))?)
+            .bind(i64::try_from(expected_revision).map_err(|_| approval_err("revision overflow"))?)
             .execute(&mut *tx)
             .await
             .map_err(internal_db)?;
@@ -646,11 +635,12 @@ impl ApprovalRepository for PostgresExecutionStore {
                  WHERE id = $1 AND revision = $4",
             )
             .bind(approval_id.0)
-            .bind(i64::try_from(updated_approval.revision)
-                .map_err(|_| approval_err("revision overflow"))?)
+            .bind(
+                i64::try_from(updated_approval.revision)
+                    .map_err(|_| approval_err("revision overflow"))?,
+            )
             .bind(updated_approval.consumed_at.map(|t| t.0))
-            .bind(i64::try_from(expected_revision)
-                .map_err(|_| approval_err("revision overflow"))?)
+            .bind(i64::try_from(expected_revision).map_err(|_| approval_err("revision overflow"))?)
             .execute(&mut *tx)
             .await
             .map_err(internal_db)?;
@@ -666,11 +656,12 @@ impl ApprovalRepository for PostgresExecutionStore {
                  WHERE id = $1 AND revision = $4",
             )
             .bind(updated_run.id.0)
-            .bind(i64::try_from(updated_run.revision)
-                .map_err(|_| super::state_error("revision overflow"))?)
+            .bind(
+                i64::try_from(updated_run.revision)
+                    .map_err(|_| super::state_error("revision overflow"))?,
+            )
             .bind(updated_run.updated_at.0)
-            .bind(i64::try_from(run_revision)
-                .map_err(|_| super::state_error("revision overflow"))?)
+            .bind(i64::try_from(run_revision).map_err(|_| super::state_error("revision overflow"))?)
             .execute(&mut *tx)
             .await
             .map_err(internal_db)?;
@@ -750,7 +741,8 @@ impl ApprovalRepository for PostgresExecutionStore {
             .await
             .map_err(internal_db)
         })?
-        .as_ref().map(row_to_action_claim)
+        .as_ref()
+        .map(row_to_action_claim)
         .transpose()
     }
 }
@@ -869,8 +861,7 @@ async fn insert_audit_event_tx(
     )
     .bind(event.id.0)
     .bind(event.run_id.0)
-    .bind(i64::try_from(event.sequence)
-        .map_err(|_| super::internal_error("sequence overflow"))?)
+    .bind(i64::try_from(event.sequence).map_err(|_| super::internal_error("sequence overflow"))?)
     .bind(audit_event_type_name(event.event_type))
     .bind(event.actor.as_str())
     .bind(event.timestamp.0)
@@ -918,13 +909,12 @@ async fn next_audit_sequence_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     run_id: &RunId,
 ) -> Result<u64, OpenWorkError> {
-    let max_seq: Option<i64> = sqlx::query_scalar(
-        "SELECT MAX(sequence) FROM audit_events WHERE run_id = $1",
-    )
-    .bind(run_id.0)
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(internal_db)?;
+    let max_seq: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(sequence) FROM audit_events WHERE run_id = $1")
+            .bind(run_id.0)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(internal_db)?;
     let current: u64 = max_seq.map_or(0, |s| u64::try_from(s).unwrap_or(0));
     current
         .checked_add(1)

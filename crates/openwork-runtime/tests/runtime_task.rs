@@ -136,10 +136,7 @@ fn codex_preparation_sets_explicit_defense_in_depth_flags() {
     // --ask-for-approval was removed from the Codex CLI (post v0.128);
     // --full-auto is deprecated in favour of --sandbox <mode>.
     // Neither flag should appear in a current invocation.
-    for removed_flag in [
-        "--ask-for-approval",
-        "--full-auto",
-    ] {
+    for removed_flag in ["--ask-for-approval", "--full-auto"] {
         assert!(
             !args.iter().any(|argument| argument == removed_flag),
             "removed/deprecated flag {removed_flag} must not be present"

@@ -4,16 +4,17 @@
 
 use openwork_core::{ErrorCode, OpenWorkError};
 use openwork_execution::{
+    ActorId, ApprovedMountDirectory, AuditEventType, DigestPinnedImageRef,
+    EXECUTION_SCHEMA_VERSION, RelativeArtifactPath, RunStatus, SandboxBackend,
+    SandboxCleanupStatus, SandboxLimits, SandboxRequest, SandboxResult, SandboxTermination,
+    SandboxUser, SandboxWorkingDirectory, UtcTimestamp,
     artifact::ArtifactScanner,
     orchestrator::ExecutionOrchestrator,
-    store::{ExecutionStore, InMemoryExecutionStore},
-    ActorId, ApprovedMountDirectory, AuditEventType, DigestPinnedImageRef, RelativeArtifactPath,
-    RunStatus, SandboxBackend, SandboxCleanupStatus, SandboxLimits, SandboxRequest, SandboxResult,
-    SandboxTermination, SandboxUser, SandboxWorkingDirectory, UtcTimestamp, EXECUTION_SCHEMA_VERSION,
     sha256_bytes,
+    store::{ExecutionStore, InMemoryExecutionStore},
 };
 use openwork_runtime::task::{
-    ClaudeTaskAdapter, RuntimeTaskAdapter, CLAUDE_RUNTIME_ID, into_sandbox_request,
+    CLAUDE_RUNTIME_ID, ClaudeTaskAdapter, RuntimeTaskAdapter, into_sandbox_request,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -36,7 +37,7 @@ const GOLDEN_SUMMARY: &str = include_str!("../../../samples/sales/golden/summary
 /// output directory and returns a successful result.  This replaces a real
 /// Docker container for offline CI runs.
 struct FakeSandbox {
-    /// (relative_path, file_content) pairs to write into the output mount.
+    /// (`relative_path`, `file_content`) pairs to write into the output mount.
     output_files: Vec<(String, String)>,
     /// Call log for test assertions.
     calls: Mutex<Vec<String>>,
@@ -57,14 +58,14 @@ impl FakeSandbox {
 
 impl SandboxBackend for FakeSandbox {
     fn health(&self) -> Result<(), OpenWorkError> {
-        self.calls.lock().expect("calls lock").push("health".to_owned());
+        self.calls
+            .lock()
+            .expect("calls lock")
+            .push("health".to_owned());
         Ok(())
     }
 
-    fn execute(
-        &self,
-        request: &SandboxRequest,
-    ) -> Result<SandboxResult, OpenWorkError> {
+    fn execute(&self, request: &SandboxRequest) -> Result<SandboxResult, OpenWorkError> {
         self.calls
             .lock()
             .expect("calls lock")
@@ -101,7 +102,9 @@ impl SandboxBackend for FakeSandbox {
             cleanup: SandboxCleanupStatus::Succeeded,
         };
         // Panic on validation failure so the test fails fast.
-        result.validate().expect("fake sandbox result must validate");
+        result
+            .validate()
+            .expect("fake sandbox result must validate");
         Ok(result)
     }
 
@@ -113,14 +116,34 @@ impl SandboxBackend for FakeSandbox {
         Ok(())
     }
 
-    fn cleanup(
-        &self,
-        _run_id: &openwork_execution::RunId,
-    ) -> Result<(), OpenWorkError> {
+    fn cleanup(&self, _run_id: &openwork_execution::RunId) -> Result<(), OpenWorkError> {
         self.calls
             .lock()
             .expect("calls lock")
             .push("cleanup".to_owned());
+        Ok(())
+    }
+}
+
+struct FailingSandbox;
+
+impl SandboxBackend for FailingSandbox {
+    fn health(&self) -> Result<(), OpenWorkError> {
+        Ok(())
+    }
+
+    fn execute(&self, _request: &SandboxRequest) -> Result<SandboxResult, OpenWorkError> {
+        Err(OpenWorkError::new(
+            ErrorCode::ExecutionFailed,
+            "simulated sandbox failure",
+        ))
+    }
+
+    fn cancel(&self, _run_id: &openwork_execution::RunId) -> Result<(), OpenWorkError> {
+        Ok(())
+    }
+
+    fn cleanup(&self, _run_id: &openwork_execution::RunId) -> Result<(), OpenWorkError> {
         Ok(())
     }
 }
@@ -144,7 +167,13 @@ impl Fixture {
         let output_root = root.path().join("approved-outputs");
         let input_dir = input_root.join("run");
         let output_dir = output_root.join("run");
-        for dir in [&workspace, &input_root, &output_root, &input_dir, &output_dir] {
+        for dir in [
+            &workspace,
+            &input_root,
+            &output_root,
+            &input_dir,
+            &output_dir,
+        ] {
             fs::create_dir(dir).expect("fixture directory");
         }
         // Write input CSV files into the sandbox input mount.
@@ -157,6 +186,128 @@ impl Fixture {
             workspace,
         }
     }
+}
+
+fn prepare_sandbox_request(
+    run: &openwork_execution::Run,
+    prompt: &str,
+    fixture: &Fixture,
+    image_digest_character: char,
+    capabilities: &[&str],
+) -> SandboxRequest {
+    let task = openwork_execution::RuntimeTask {
+        schema_version: EXECUTION_SCHEMA_VERSION,
+        run_id: run.id.clone(),
+        runtime: CLAUDE_RUNTIME_ID.to_owned(),
+        prompt: prompt.to_owned(),
+        prompt_hash: sha256_bytes(prompt.as_bytes()),
+        working_directory: SandboxWorkingDirectory::parse("/workspace")
+            .expect("valid working directory"),
+        timeout_seconds: 300,
+        capabilities: capabilities.iter().map(ToString::to_string).collect(),
+    };
+    task.validate().expect("task must be valid");
+
+    let invocation = ClaudeTaskAdapter::new("/usr/bin/claude")
+        .prepare(&task)
+        .expect("prepare invocation");
+    let image = DigestPinnedImageRef::parse(format!(
+        "ghcr.io/openwork/sandbox@sha256:{}",
+        image_digest_character.to_string().repeat(64)
+    ))
+    .expect("valid pinned image");
+    let user = SandboxUser::new(65_532, 65_532).expect("non-root user");
+    let input_mount = ApprovedMountDirectory::under_root(
+        &fixture.input_dir,
+        fixture.input_dir.parent().expect("input root"),
+    )
+    .expect("approved input mount");
+    let output_mount = ApprovedMountDirectory::under_root(
+        &fixture.output_dir,
+        fixture.output_dir.parent().expect("output root"),
+    )
+    .expect("approved output mount");
+    let limits =
+        SandboxLimits::new(1000, 268_435_456, 128, 300, 1_048_576).expect("valid sandbox limits");
+
+    into_sandbox_request(
+        invocation,
+        run.id.clone(),
+        image,
+        user,
+        input_mount,
+        output_mount,
+        limits,
+    )
+    .expect("sandbox request")
+}
+
+fn assert_successful_run(final_run: &openwork_execution::Run) {
+    assert_eq!(final_run.status, RunStatus::Succeeded);
+    assert!(final_run.completed_at.is_some(), "completed_at must be set");
+    assert!(
+        final_run.started_at.is_some(),
+        "started_at must be set on transition to Running"
+    );
+    assert!(
+        final_run.terminal_reason.is_none(),
+        "successful runs must not have a terminal reason"
+    );
+    assert_eq!(final_run.revision, 3, "expected three transitions");
+}
+
+fn assert_golden_artifacts(
+    orchestrator: &ExecutionOrchestrator<InMemoryExecutionStore>,
+    run_id: &openwork_execution::RunId,
+) {
+    let artifacts = orchestrator
+        .store()
+        .artifacts(run_id)
+        .expect("read artifacts");
+    assert_eq!(artifacts.len(), 2, "exactly two artifacts expected");
+
+    let analysis = artifacts
+        .iter()
+        .find(|artifact| artifact.path.as_str() == "sales-analysis.csv")
+        .expect("sales-analysis.csv artifact");
+    let summary = artifacts
+        .iter()
+        .find(|artifact| artifact.path.as_str() == "summary.md")
+        .expect("summary.md artifact");
+    assert_eq!(analysis.media_type, "text/csv");
+    assert_eq!(summary.media_type, "text/markdown");
+    assert_eq!(analysis.sha256, sha256_bytes(GOLDEN_ANALYSIS.as_bytes()));
+    assert_eq!(summary.sha256, sha256_bytes(GOLDEN_SUMMARY.as_bytes()));
+    assert_eq!(analysis.size_bytes.get(), GOLDEN_ANALYSIS.len() as u64);
+    assert_eq!(summary.size_bytes.get(), GOLDEN_SUMMARY.len() as u64);
+}
+
+fn assert_audit_chain(
+    orchestrator: &ExecutionOrchestrator<InMemoryExecutionStore>,
+    run_id: &openwork_execution::RunId,
+) {
+    let events = orchestrator
+        .store()
+        .audit_events(run_id)
+        .expect("read audit events");
+    assert!(
+        events.len() >= 6,
+        "expected the complete pipeline audit trail"
+    );
+    events[0]
+        .verify_integrity(1, None)
+        .expect("genesis event must start the chain");
+    for window in events.windows(2) {
+        window[1]
+            .verify_integrity(window[1].sequence, Some(window[0].event_hash()))
+            .expect("audit chain must be intact");
+        assert!(window[1].timestamp >= window[0].timestamp);
+    }
+    assert_eq!(events[0].event_type, AuditEventType::RunCreated);
+    assert!(matches!(
+        events.last().expect("last event").event_type,
+        AuditEventType::RunCompleted | AuditEventType::ArtifactCreated
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -208,65 +359,20 @@ fn full_execution_pipeline_sales_analysis_vertical_slice() {
     assert_eq!(run.status, RunStatus::Planning);
     assert_eq!(run.revision, 1);
 
-    // ---- Step 2: prepare RuntimeTask for Claude ------------------------
-    let task = openwork_execution::RuntimeTask {
-        schema_version: EXECUTION_SCHEMA_VERSION,
-        run_id: run.id.clone(),
-        runtime: CLAUDE_RUNTIME_ID.to_owned(),
-        prompt: prompt.to_owned(),
-        prompt_hash: sha256_bytes(prompt.as_bytes()),
-        working_directory: SandboxWorkingDirectory::parse("/workspace")
-            .expect("valid working directory"),
-        timeout_seconds: 300,
-        capabilities: vec![
-            "filesystem.read".to_owned(),
-            "filesystem.write".to_owned(),
-        ],
-    };
-    // Validate the task ourselves since we construct it by hand.
-    task.validate().expect("task must be valid");
-
-    let adapter = ClaudeTaskAdapter::new("/usr/bin/claude");
-    let invocation = adapter.prepare(&task).expect("prepare invocation");
-
-    // ---- Step 3: convert to SandboxRequest via into_sandbox_request ----
-    let image = DigestPinnedImageRef::parse(format!(
-        "ghcr.io/openwork/sandbox@sha256:{}",
-        "a".repeat(64)
-    ))
-    .expect("valid pinned image");
-
-    let user = SandboxUser::new(65_532, 65_532).expect("non-root user");
-
-    let input_mount = ApprovedMountDirectory::under_root(
-        &fixture.input_dir,
-        &fixture.input_dir.parent().expect("input root"),
-    )
-    .expect("approved input mount");
-
-    let output_mount = ApprovedMountDirectory::under_root(
-        &fixture.output_dir,
-        &fixture.output_dir.parent().expect("output root"),
-    )
-    .expect("approved output mount");
-
-    let limits =
-        SandboxLimits::new(1000, 268_435_456, 128, 300, 1_048_576).expect("valid sandbox limits");
-
-    let sandbox_request = into_sandbox_request(
-        invocation,
-        run.id.clone(),
-        image,
-        user,
-        input_mount,
-        output_mount,
-        limits,
-    )
-    .expect("sandbox request");
+    let sandbox_request = prepare_sandbox_request(
+        &run,
+        prompt,
+        &fixture,
+        'a',
+        &["filesystem.read", "filesystem.write"],
+    );
 
     // Verify the request was assembled correctly.
     assert_eq!(sandbox_request.run_id, run.id);
-    assert!(sandbox_request.command.stdin().len() > 0, "stdin must carry the prompt");
+    assert!(
+        !sandbox_request.command.stdin().is_empty(),
+        "stdin must carry the prompt"
+    );
     assert_eq!(
         sandbox_request.command.program(),
         "/usr/bin/claude",
@@ -275,135 +381,23 @@ fn full_execution_pipeline_sales_analysis_vertical_slice() {
 
     // ---- Step 4: execute via test sandbox ------------------------------
     let sandbox = FakeSandbox::new(vec![
-        (
-            "sales-analysis.csv".to_owned(),
-            GOLDEN_ANALYSIS.to_owned(),
-        ),
+        ("sales-analysis.csv".to_owned(), GOLDEN_ANALYSIS.to_owned()),
         ("summary.md".to_owned(), GOLDEN_SUMMARY.to_owned()),
     ]);
 
-    let execute_time = UtcTimestamp::now();
     let final_run = orchestrator
-        .execute(&run, &sandbox, &sandbox_request, actor.clone(), execute_time)
+        .execute(
+            &run,
+            &sandbox,
+            &sandbox_request,
+            actor.clone(),
+            UtcTimestamp::now(),
+        )
         .expect("orchestrator execute must succeed");
-
-    // ---- Step 7: verify run terminal status ----------------------------
-    assert_eq!(
-        final_run.status,
-        RunStatus::Succeeded,
-        "run must reach Succeeded"
-    );
-    assert!(final_run.completed_at.is_some(), "completed_at must be set");
-    assert!(
-        final_run.started_at.is_some(),
-        "started_at must be set on transition to Running"
-    );
-    assert!(
-        final_run.terminal_reason.is_none(),
-        "successful runs must not have a terminal reason"
-    );
-    assert_eq!(final_run.revision, 3, "expected three transitions");
-
-    // ---- Step 5: verify artifacts are recorded -------------------------
-    let artifacts = orchestrator
-        .store()
-        .artifacts(&run.id)
-        .expect("read artifacts");
-    assert_eq!(artifacts.len(), 2, "exactly two artifacts expected");
-
-    let analysis_artifact = artifacts
-        .iter()
-        .find(|a| a.path.as_str() == "sales-analysis.csv")
-        .expect("sales-analysis.csv artifact");
-    let summary_artifact = artifacts
-        .iter()
-        .find(|a| a.path.as_str() == "summary.md")
-        .expect("summary.md artifact");
-
-    assert_eq!(analysis_artifact.media_type, "text/csv");
-    assert_eq!(summary_artifact.media_type, "text/markdown");
-
-    // Verify artifact hashes match golden content.
-    let expected_analysis_hash = sha256_bytes(GOLDEN_ANALYSIS.as_bytes());
-    let expected_summary_hash = sha256_bytes(GOLDEN_SUMMARY.as_bytes());
-    assert_eq!(
-        analysis_artifact.sha256, expected_analysis_hash,
-        "analysis artifact hash must match golden"
-    );
-    assert_eq!(
-        summary_artifact.sha256, expected_summary_hash,
-        "summary artifact hash must match golden"
-    );
-
-    // Verify size matches content length.
-    assert_eq!(
-        analysis_artifact.size_bytes.get(),
-        GOLDEN_ANALYSIS.len() as u64
-    );
-    assert_eq!(
-        summary_artifact.size_bytes.get(),
-        GOLDEN_SUMMARY.len() as u64
-    );
-
-    // ---- Step 6: verify audit chain integrity --------------------------
-    let events = orchestrator
-        .store()
-        .audit_events(&run.id)
-        .expect("read audit events");
-
-    // Expected event sequence (includes the manual Planning transition):
-    //   1. RunCreated        (from create_run)
-    //   2. RuntimeSelected   (Queued -> Planning, manually)
-    //   3. RuntimeStarted    (Planning -> Running, first execute step)
-    //   4. ArtifactCreated   (first artifact)
-    //   5. ArtifactCreated   (second artifact)
-    //   6. RunCompleted      (Running -> Succeeded)
-    assert!(
-        events.len() >= 6,
-        "at least six audit events (planning transition adds an event)"
-    );
-
-    // Verify chain integrity: each event must reference the previous hash.
-    for window in events.windows(2) {
-        let previous = &window[0];
-        let current = &window[1];
-        current
-            .verify_integrity(
-                current.sequence,
-                Some(previous.event_hash()),
-            )
-            .expect("audit chain must be intact between consecutive events");
-    }
-
-    // Verify that the first event is the genesis event with no previous hash.
-    let genesis = &events[0];
-    genesis
-        .verify_integrity(1, None)
-        .expect("genesis event must start the chain");
-
-    // Verify event ordering constraints: timestamps must be monotonic.
-    for window in events.windows(2) {
-        assert!(
-            window[1].timestamp >= window[0].timestamp,
-            "audit timestamps must be monotonic"
-        );
-    }
-
-    // Verify the first and last event types.
-    assert_eq!(
-        events[0].event_type,
-        AuditEventType::RunCreated,
-        "first event must be RunCreated"
-    );
-    let last_type = events.last().expect("last event").event_type;
-    assert!(
-        matches!(last_type, AuditEventType::RunCompleted | AuditEventType::ArtifactCreated),
-        "last event must be RunCompleted or ArtifactCreated (final transition recorded last): got {last_type:?}"
-    );
-
-    // Verify the fake sandbox was actually called.
-    let calls = sandbox.call_log();
-    assert!(calls.contains(&"execute".to_owned()), "sandbox must have been called via execute");
+    assert_successful_run(&final_run);
+    assert_golden_artifacts(&orchestrator, &run.id);
+    assert_audit_chain(&orchestrator, &run.id);
+    assert!(sandbox.call_log().contains(&"execute".to_owned()));
 
     // Verify the original run is retrievable by id.
     let stored = orchestrator
@@ -429,7 +423,13 @@ fn pipeline_single_artifact_minimal_chain() {
     let output_root = root.path().join("outputs");
     let input_dir = input_root.join("run");
     let output_dir = output_root.join("run");
-    for dir in [&workspace, &input_root, &output_root, &input_dir, &output_dir] {
+    for dir in [
+        &workspace,
+        &input_root,
+        &output_root,
+        &input_dir,
+        &output_dir,
+    ] {
         fs::create_dir(dir).expect("dir");
     }
 
@@ -481,20 +481,15 @@ fn pipeline_single_artifact_minimal_chain() {
 
     let user = SandboxUser::new(65_532, 65_532).expect("user");
 
-    let input_mount = ApprovedMountDirectory::under_root(
-        &input_dir,
-        &input_dir.parent().expect("input root"),
-    )
-    .expect("input mount");
+    let input_mount =
+        ApprovedMountDirectory::under_root(&input_dir, input_dir.parent().expect("input root"))
+            .expect("input mount");
 
-    let output_mount = ApprovedMountDirectory::under_root(
-        &output_dir,
-        &output_dir.parent().expect("output root"),
-    )
-    .expect("output mount");
+    let output_mount =
+        ApprovedMountDirectory::under_root(&output_dir, output_dir.parent().expect("output root"))
+            .expect("output mount");
 
-    let limits =
-        SandboxLimits::new(1000, 268_435_456, 128, 300, 1_048_576).expect("limits");
+    let limits = SandboxLimits::new(1000, 268_435_456, 128, 300, 1_048_576).expect("limits");
 
     let sandbox_request = into_sandbox_request(
         invocation,
@@ -522,10 +517,7 @@ fn pipeline_single_artifact_minimal_chain() {
 
     assert_eq!(final_run.status, RunStatus::Succeeded);
 
-    let artifacts = orchestrator
-        .store()
-        .artifacts(&run.id)
-        .expect("artifacts");
+    let artifacts = orchestrator.store().artifacts(&run.id).expect("artifacts");
     assert_eq!(artifacts.len(), 1);
     assert_eq!(artifacts[0].path.as_str(), "result.txt");
     assert_eq!(artifacts[0].media_type, "text/plain");
@@ -549,7 +541,13 @@ fn pipeline_sandbox_failure_records_failed_state() {
     let output_root = root.path().join("outputs");
     let input_dir = input_root.join("run");
     let output_dir = output_root.join("run");
-    for dir in [&workspace, &input_root, &output_root, &input_dir, &output_dir] {
+    for dir in [
+        &workspace,
+        &input_root,
+        &output_root,
+        &input_dir,
+        &output_dir,
+    ] {
         fs::create_dir(dir).expect("dir");
     }
 
@@ -601,20 +599,15 @@ fn pipeline_sandbox_failure_records_failed_state() {
 
     let user = SandboxUser::new(65_532, 65_532).expect("user");
 
-    let input_mount = ApprovedMountDirectory::under_root(
-        &input_dir,
-        &input_dir.parent().expect("input root"),
-    )
-    .expect("input mount");
+    let input_mount =
+        ApprovedMountDirectory::under_root(&input_dir, input_dir.parent().expect("input root"))
+            .expect("input mount");
 
-    let output_mount = ApprovedMountDirectory::under_root(
-        &output_dir,
-        &output_dir.parent().expect("output root"),
-    )
-    .expect("output mount");
+    let output_mount =
+        ApprovedMountDirectory::under_root(&output_dir, output_dir.parent().expect("output root"))
+            .expect("output mount");
 
-    let limits =
-        SandboxLimits::new(1000, 268_435_456, 128, 300, 1_048_576).expect("limits");
+    let limits = SandboxLimits::new(1000, 268_435_456, 128, 300, 1_048_576).expect("limits");
 
     let sandbox_request = into_sandbox_request(
         invocation,
@@ -627,38 +620,6 @@ fn pipeline_sandbox_failure_records_failed_state() {
     )
     .expect("sandbox request");
 
-    // A sandbox that always fails.
-    struct FailingSandbox;
-    impl SandboxBackend for FailingSandbox {
-        fn health(&self) -> Result<(), OpenWorkError> {
-            Ok(())
-        }
-
-        fn execute(
-            &self,
-            _request: &SandboxRequest,
-        ) -> Result<SandboxResult, OpenWorkError> {
-            Err(OpenWorkError::new(
-                ErrorCode::ExecutionFailed,
-                "simulated sandbox failure",
-            ))
-        }
-
-        fn cancel(
-            &self,
-            _run_id: &openwork_execution::RunId,
-        ) -> Result<(), OpenWorkError> {
-            Ok(())
-        }
-
-        fn cleanup(
-            &self,
-            _run_id: &openwork_execution::RunId,
-        ) -> Result<(), OpenWorkError> {
-            Ok(())
-        }
-    }
-
     let failing_sandbox = FailingSandbox;
     let result = orchestrator.execute(
         &run,
@@ -668,7 +629,10 @@ fn pipeline_sandbox_failure_records_failed_state() {
         UtcTimestamp::now(),
     );
 
-    assert!(result.is_err(), "orchestrator must propagate sandbox failure");
+    assert!(
+        result.is_err(),
+        "orchestrator must propagate sandbox failure"
+    );
 
     // The orchestrator's error handler records a best-effort transition to
     // Failed so the run is terminal even when the sandbox fails.
