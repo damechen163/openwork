@@ -1,10 +1,13 @@
 use openwork_core::ErrorCode;
-use openwork_execution::{RunId, RuntimeEventPayload, RuntimeTask};
+use openwork_execution::{
+    EXECUTION_SCHEMA_VERSION, RunId, RuntimeEventPayload, RuntimeTask, SandboxCleanupStatus,
+    SandboxResult, SandboxTermination, UtcTimestamp,
+};
 use openwork_runtime::task::{
     CLAUDE_CLI_REFERENCE_URL, CLAUDE_HEADLESS_URL, CODEX_CLI_REFERENCE_URL,
     CODEX_NON_INTERACTIVE_URL, ClaudeTaskAdapter, CodexTaskAdapter, MAX_PROVIDER_LINE_BYTES,
     MAX_RUNTIME_PROMPT_BYTES, PROVIDER_DOCS_ACCESSED_ON, PROVIDER_VERSION_GATE_POLICY,
-    RuntimeEventDecoder, RuntimeTaskAdapter,
+    RuntimeEventDecoder, RuntimeTaskAdapter, decode_sandbox_result,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -52,6 +55,30 @@ fn decode_fixture(
                 .expect("fixture line")
         })
         .collect()
+}
+
+fn sandbox_result(
+    run_id: RunId,
+    termination: SandboxTermination,
+    exit_code: Option<i32>,
+    stdout: impl Into<String>,
+    stderr: impl Into<String>,
+) -> SandboxResult {
+    let timestamp = UtcTimestamp::parse("2026-08-10T00:00:00Z").expect("timestamp");
+    SandboxResult {
+        schema_version: EXECUTION_SCHEMA_VERSION,
+        run_id,
+        sandbox_id: "sandbox-runtime-output".to_owned(),
+        termination,
+        exit_code,
+        stdout: stdout.into(),
+        stderr: stderr.into(),
+        truncated: false,
+        started_at: timestamp,
+        completed_at: timestamp,
+        output_paths: Vec::new(),
+        cleanup: SandboxCleanupStatus::Succeeded,
+    }
 }
 
 #[test]
@@ -364,6 +391,156 @@ fn provider_failure_is_terminal_and_real_exit_code_drives_completion() {
         codex.finish(17).unwrap().unwrap().payload,
         RuntimeEventPayload::Failed { ref code, .. } if code == "provider_exit_nonzero"
     ));
+}
+
+#[test]
+fn sandbox_result_decoding_maps_jsonl_stderr_and_observed_exit() {
+    let run_id = RunId::generate();
+    let result = sandbox_result(
+        run_id.clone(),
+        SandboxTermination::Exited,
+        Some(0),
+        include_str!("fixtures/codex-stream.jsonl"),
+        "Authorization: Bearer stderr-secret\n",
+    );
+    let mut decoder = CodexTaskAdapter::new("/opt/codex").decoder(run_id.clone());
+
+    let events = decode_sandbox_result(&result, decoder.as_mut()).expect("decoded result");
+
+    assert_eq!(events.len(), 8);
+    assert!(events.iter().enumerate().all(|(index, event)| {
+        event.run_id == run_id && event.sequence == u64::try_from(index + 1).unwrap()
+    }));
+    let RuntimeEventPayload::Stderr {
+        chunk,
+        truncated: false,
+    } = &events[6].payload
+    else {
+        panic!("expected stderr event");
+    };
+    assert!(chunk.contains("[REDACTED]"));
+    assert!(!chunk.contains("Bearer"));
+    assert!(!chunk.contains("stderr-secret"));
+    assert!(matches!(
+        events[7].payload,
+        RuntimeEventPayload::Completed { exit_code: 0 }
+    ));
+    let debug = format!("{events:?}");
+    assert!(!debug.contains("stderr-secret"));
+    assert!(!debug.contains("TOKEN=visible"));
+}
+
+#[test]
+fn sandbox_result_decoding_fails_closed_for_incomplete_or_invalid_streams() {
+    let run_id = RunId::generate();
+    let mut truncated = sandbox_result(
+        run_id.clone(),
+        SandboxTermination::Exited,
+        Some(0),
+        r#"{"type":"thread.started"}"#,
+        "",
+    );
+    truncated.truncated = true;
+    let mut decoder = CodexTaskAdapter::new("/opt/codex").decoder(run_id.clone());
+    assert!(decode_sandbox_result(&truncated, decoder.as_mut()).is_err());
+
+    for stdout in [
+        "not-json".to_owned(),
+        r#"{"type":"thread.started","type":"turn.completed"}"#.to_owned(),
+        "\n".to_owned(),
+        format!(
+            "{{\"type\":\"turn.started\",\"padding\":\"{}\"}}",
+            "x".repeat(MAX_PROVIDER_LINE_BYTES)
+        ),
+    ] {
+        let result = sandbox_result(
+            run_id.clone(),
+            SandboxTermination::Exited,
+            Some(0),
+            stdout,
+            "",
+        );
+        let mut decoder = CodexTaskAdapter::new("/opt/codex").decoder(run_id.clone());
+        assert!(decode_sandbox_result(&result, decoder.as_mut()).is_err());
+    }
+}
+
+#[test]
+fn non_exited_sandbox_states_never_synthesize_provider_completion() {
+    for (termination, exit_code) in [
+        (SandboxTermination::Cancelled, None),
+        (SandboxTermination::TimedOut, None),
+        (SandboxTermination::OutOfMemory, None),
+        (SandboxTermination::Failed, None),
+        (SandboxTermination::Failed, Some(137)),
+    ] {
+        let run_id = RunId::generate();
+        let result = sandbox_result(
+            run_id.clone(),
+            termination,
+            exit_code,
+            r#"{"type":"thread.started"}"#,
+            "",
+        );
+        let mut decoder = CodexTaskAdapter::new("/opt/codex").decoder(run_id);
+        let events = decode_sandbox_result(&result, decoder.as_mut()).expect("decoded output");
+        assert!(matches!(events[0].payload, RuntimeEventPayload::Started));
+        assert!(events.iter().all(|event| !matches!(
+            event.payload,
+            RuntimeEventPayload::Completed { .. }
+                | RuntimeEventPayload::Failed { .. }
+                | RuntimeEventPayload::Cancelled
+        )));
+    }
+}
+
+#[test]
+fn output_after_provider_terminal_and_mismatched_decoder_fail_closed() {
+    let run_id = RunId::generate();
+    let terminal_then_output = sandbox_result(
+        run_id.clone(),
+        SandboxTermination::Exited,
+        Some(1),
+        concat!(
+            r#"{"type":"turn.failed","message":"TOKEN=secret"}"#,
+            "\n",
+            r#"{"type":"turn.completed"}"#
+        ),
+        "",
+    );
+    let mut decoder = CodexTaskAdapter::new("/opt/codex").decoder(run_id.clone());
+    assert!(decode_sandbox_result(&terminal_then_output, decoder.as_mut()).is_err());
+
+    let valid = sandbox_result(
+        run_id,
+        SandboxTermination::Exited,
+        Some(0),
+        r#"{"type":"thread.started"}"#,
+        "",
+    );
+    let mut wrong_decoder = CodexTaskAdapter::new("/opt/codex").decoder(RunId::generate());
+    assert!(decode_sandbox_result(&valid, wrong_decoder.as_mut()).is_err());
+}
+
+#[test]
+fn orchestrator_output_processor_shape_propagates_decoder_errors() {
+    let run_id = RunId::generate();
+    let malformed = sandbox_result(
+        run_id.clone(),
+        SandboxTermination::Exited,
+        Some(0),
+        "not-json",
+        "",
+    );
+    let mut decoder = CodexTaskAdapter::new("/opt/codex").decoder(run_id);
+    let mut process_output =
+        |result: &SandboxResult| decode_sandbox_result(result, decoder.as_mut()).map(|_events| ());
+
+    // This closure is the exact shape accepted by
+    // ExecutionOrchestrator::execute_with_output_processor. The execution
+    // crate owns the assertion that this propagated error transitions a run
+    // to Failed.
+    assert!(process_output(&malformed).is_err());
 }
 
 #[test]

@@ -1,8 +1,8 @@
 //! Audit append inputs and canonical event construction.
 
 use crate::{
-    ActorId, Artifact, AuditEvent, AuditEventId, AuditEventType, RedactedAuditMetadata, RunId,
-    RunStatus, Sha256Digest, UtcTimestamp,
+    ActionId, ActorId, Artifact, AuditEvent, AuditEventId, AuditEventType, RedactedAuditMetadata,
+    RunId, RunStatus, Sha256Digest, UtcTimestamp,
 };
 use openwork_core::OpenWorkError;
 use serde_json::Value;
@@ -25,6 +25,10 @@ enum AuditDetails {
     Artifact {
         sha256: Sha256Digest,
         size_bytes: u64,
+    },
+    ActionExecution {
+        action_id: ActionId,
+        parameter_hash: Sha256Digest,
     },
 }
 
@@ -51,6 +55,18 @@ impl AuditAppend {
         self
     }
 
+    pub(crate) fn with_action_execution(
+        mut self,
+        action_id: ActionId,
+        parameter_hash: Sha256Digest,
+    ) -> Self {
+        self.details = AuditDetails::ActionExecution {
+            action_id,
+            parameter_hash,
+        };
+        self
+    }
+
     pub(crate) fn build(
         &self,
         run_id: RunId,
@@ -72,6 +88,19 @@ impl AuditAppend {
                 (
                     "artifact_size_bytes".to_owned(),
                     Value::Number((*size_bytes).into()),
+                ),
+            ]),
+            AuditDetails::ActionExecution {
+                action_id,
+                parameter_hash,
+            } => BTreeMap::from([
+                (
+                    "action_id".to_owned(),
+                    Value::String(action_id.to_hyphenated()),
+                ),
+                (
+                    "parameter_hash".to_owned(),
+                    Value::String(parameter_hash.as_str().to_owned()),
                 ),
             ]),
         };

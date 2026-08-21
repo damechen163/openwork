@@ -1,0 +1,20 @@
+version: 1
+defaults:
+  unknown: deny
+actions:
+  filesystem.read:
+    risk: L0
+    decision: allow
+  filesystem.write:
+    risk: L1
+    decision: allow
+  email.send:
+    risk: L3
+    decision: approval
+    resources:
+      exact:
+        mailto:sales-manager@example.invalid: approval
+      default: deny
+  database.delete:
+    risk: L4
+    decision: deny

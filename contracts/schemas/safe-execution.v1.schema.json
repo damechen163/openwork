@@ -91,7 +91,7 @@
         "id": { "$ref": "#/$defs/uuidV7" },
         "run_id": { "$ref": "#/$defs/uuidV7" },
         "sequence": { "type": "integer", "minimum": 1 },
-        "event_type": { "enum": ["run_created", "runtime_selected", "sandbox_created", "action_requested", "policy_allowed", "policy_denied", "approval_requested", "approval_approved", "approval_denied", "approval_expired", "approval_consumed", "runtime_started", "runtime_output", "artifact_created", "runtime_completed", "sandbox_destroyed", "run_completed", "run_failed", "approval_binding_mismatch"] },
+        "event_type": { "enum": ["run_created", "runtime_selected", "sandbox_created", "action_requested", "policy_allowed", "policy_denied", "approval_requested", "approval_approved", "approval_denied", "approval_expired", "approval_consumed", "action_executed", "runtime_started", "runtime_output", "artifact_created", "runtime_completed", "sandbox_destroyed", "run_completed", "run_failed", "approval_binding_mismatch"] },
         "actor": { "$ref": "#/$defs/actorId" },
         "timestamp": { "$ref": "#/$defs/timestamp" },
         "metadata": { "type": "object" },

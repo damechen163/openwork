@@ -7,15 +7,17 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+openwork-core = { path = "../openwork-core" }
 openwork-execution = { path = "../openwork-execution" }
+openwork-sandbox = { path = "../openwork-sandbox" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
-openwork-core = { path = "../openwork-core" }
+openwork-policy = { path = "../openwork-policy" }
 openwork-runtime = { path = "../openwork-runtime" }
-tempfile.workspace = true
 
 [lints]
 workspace = true

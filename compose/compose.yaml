@@ -31,13 +31,21 @@ services:
       OPENWORK_API_TOKEN: ${OPENWORK_API_TOKEN:?set OPENWORK_API_TOKEN}
       OPENWORK_API_ACTOR: ${OPENWORK_API_ACTOR:-control-admin}
       OPENWORK_CONTROL_BIND: 0.0.0.0:8080
+      OPENWORK_WORKSPACE_ROOT: /workspaces
     ports: ["127.0.0.1:${OPENWORK_CONTROL_PORT:-8080}:8080"]
+    volumes:
+      - type: bind
+        source: ${OPENWORK_HOST_WORKSPACE_ROOT:?set OPENWORK_HOST_WORKSPACE_ROOT}
+        target: /workspaces
+        read_only: true
     healthcheck:
       test: ["CMD", "/usr/local/bin/openwork-control-api", "--healthcheck"]
       interval: 5s
       timeout: 3s
       retries: 12
-    networks: [control]
+    # Keep database traffic on the internal network while a separate ingress
+    # bridge makes the loopback-published HTTP port reachable from the host.
+    networks: [control, ingress]
     read_only: true
     tmpfs: ["/tmp:rw,noexec,nosuid,size=16m"]
     cap_drop: [ALL]
@@ -59,6 +67,7 @@ services:
 networks:
   control:
     internal: true
+  ingress:
   gateway-egress:
 
 volumes:

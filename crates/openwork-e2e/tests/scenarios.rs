@@ -13,7 +13,7 @@ fn risky_and_destructive_scenarios_pin_exact_action_bindings() {
     assert_eq!(risky.expected_decision(), PolicyDecision::RequireApproval);
     assert_eq!(
         risky.action_request().parameter_hash().as_str(),
-        "51fabbc4f0808fa649e077f42b7ab792a606a8c95265136614fe9a032703c674"
+        "dd61f447dd966d3b9e0546fdbb9ba5de9685f327dec4f69a98d7c35aa21c5355"
     );
 
     let destructive = ScenarioFixture::from_json(DESTRUCTIVE).expect("destructive scenario");
@@ -27,7 +27,7 @@ fn risky_and_destructive_scenarios_pin_exact_action_bindings() {
 
 #[test]
 fn tampered_parameters_labels_and_duplicate_fields_are_rejected() {
-    let changed_recipient = RISKY.replace("external@example.net", "other@example.net");
+    let changed_recipient = RISKY.replace("sales-manager@example.invalid", "other@example.invalid");
     assert!(ScenarioFixture::from_json(&changed_recipient).is_err());
     let lowered_risk = RISKY.replace("\"L3\"", "\"L0\"");
     assert!(ScenarioFixture::from_json(&lowered_risk).is_err());

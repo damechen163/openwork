@@ -6,10 +6,8 @@ use openwork_config::{
 };
 use openwork_core::{ErrorCode, OpenWorkError, PRODUCT_NAME};
 use openwork_doctor::{CheckStatus, DoctorReport, inspect_platform};
-use openwork_execution::artifact::ArtifactScanner;
-use openwork_execution::orchestrator::ExecutionOrchestrator;
-use openwork_execution::store::InMemoryExecutionStore;
-use openwork_execution::{ActorId, RunStatus, UtcTimestamp};
+use openwork_e2e::sales_demo::{SalesDemoConfig, SalesDemoReport, run_sales_demo};
+use openwork_execution::DigestPinnedImageRef;
 use openwork_installer::{
     ExecutionMode, InstallExecutionFailure, InstallExecutionReport, InstallExecutor, InstallPlan,
     StepResult, StepStatus, dry_run_plan, managed_runtime_plan,
@@ -21,6 +19,7 @@ use openwork_runtime::{
     SystemCommandRunner, SystemDownloader,
 };
 use serde::Serialize;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -81,13 +80,41 @@ enum Command {
         #[arg(long, short)]
         workspace: String,
         /// Natural-language task description (supplied via stdin to the provider).
-        #[arg(trailing_var_arg = true, required = true)]
-        prompt: Vec<String>,
+        #[arg(long)]
+        prompt: String,
         /// Wait for the run to complete before returning.
         #[arg(long)]
         wait: bool,
+        /// Emit a structured error or result.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a deterministic, evidence-producing product demo.
+    Demo {
+        #[command(subcommand)]
+        command: DemoCommand,
     },
 }
+
+#[derive(Debug, Subcommand)]
+enum DemoCommand {
+    /// Analyze the embedded July/August sales fixtures in a real container.
+    Sales {
+        /// Absolute Docker-compatible CLI path. Known Docker Desktop paths are auto-detected.
+        #[arg(long)]
+        engine_bin: Option<PathBuf>,
+        /// Exact digest-pinned BusyBox-compatible image.
+        #[arg(long, default_value = SALES_DEMO_IMAGE)]
+        image: String,
+        /// Root that retains the unique run output directory.
+        #[arg(long, default_value = "openwork-demo-output")]
+        output_root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+const SALES_DEMO_IMAGE: &str = "docker.io/library/busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0";
 
 #[derive(Debug, Subcommand)]
 enum RuntimeCommand {
@@ -225,7 +252,9 @@ fn execute(cli: Cli, probe: &impl PlatformProbe) -> Result<u8, (OpenWorkError, b
             workspace,
             prompt,
             wait: _wait,
-        } => execute_run(&runtime, &workspace, &prompt.join(" ")),
+            json,
+        } => execute_run(&runtime, &workspace, &prompt, json),
+        Command::Demo { command } => execute_demo(command),
         Command::Runtime {
             command: RuntimeCommand::Info { id, json },
         } => {
@@ -546,40 +575,137 @@ fn resolved_runtime_entry(
     ))
 }
 
-fn execute_run(runtime: &str, workspace: &str, prompt: &str) -> Result<u8, (OpenWorkError, bool)> {
-    use std::path::Path;
-
-    let actor = ActorId::parse("cli-user").map_err(|e| (e, false))?;
-    let now = UtcTimestamp::now();
-    let workspace_path = Path::new(workspace);
-
-    // Create the orchestrator with in-memory store
-    let store = InMemoryExecutionStore::default();
-    let scanner = ArtifactScanner::new(100 * 1024 * 1024).map_err(|e| (e, false))?;
-    let orchestrator = ExecutionOrchestrator::new(store, scanner);
-
-    // Create the run — only the SHA-256 of the prompt is persisted
-    let run = orchestrator
-        .create_run(runtime, workspace_path, actor, prompt, now)
-        .map_err(|e| (e, false))?;
-
-    println!("OpenWork Run\n");
-    println!("  Run ID:    {}", run.id);
-    println!("  Runtime:   {}", run.runtime);
-    println!("  Workspace:  {}", run.workspace.display());
-    println!("  Status:    {:?}", run.status);
-    println!();
-
-    if run.status == RunStatus::Queued {
-        println!("Run created successfully. Execution requires a configured sandbox backend.");
-        println!();
-        println!("Run ID: {}", run.id);
-        println!();
-        println!("To execute with full sandbox isolation, ensure Docker is available");
-        println!("and the sandbox backend is configured.");
+fn execute_run(
+    runtime: &str,
+    workspace: &str,
+    prompt: &str,
+    json: bool,
+) -> Result<u8, (OpenWorkError, bool)> {
+    if !matches!(runtime, "claude-code" | "codex")
+        || prompt.is_empty()
+        || !Path::new(workspace).is_dir()
+    {
+        return Err((
+            OpenWorkError::new(ErrorCode::InvalidArguments, "invalid run request"),
+            json,
+        ));
     }
+    Err((
+        OpenWorkError::new(
+            ErrorCode::SandboxUnavailable,
+            "no durable runtime worker is configured; no run was created",
+        )
+        .with_remediation(
+            "Configure the Control API and a sandbox worker, or run `openwork demo sales` to verify the local M1 execution path.",
+        ),
+        json,
+    ))
+}
 
+fn execute_demo(command: DemoCommand) -> Result<u8, (OpenWorkError, bool)> {
+    match command {
+        DemoCommand::Sales {
+            engine_bin,
+            image,
+            output_root,
+            json,
+        } => execute_sales_demo(engine_bin, &image, &output_root, json),
+    }
+}
+
+fn execute_sales_demo(
+    engine_bin: Option<PathBuf>,
+    image: &str,
+    output_root: &Path,
+    json: bool,
+) -> Result<u8, (OpenWorkError, bool)> {
+    let engine_bin = resolve_container_engine(engine_bin).map_err(|error| (error, json))?;
+    let image = DigestPinnedImageRef::parse(image).map_err(|error| (error, json))?;
+    let output_root = if output_root.is_absolute() {
+        output_root.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|_| {
+                (
+                    OpenWorkError::new(
+                        ErrorCode::Io,
+                        "current directory is unavailable for demo output",
+                    ),
+                    json,
+                )
+            })?
+            .join(output_root)
+    };
+    let report = run_sales_demo(SalesDemoConfig {
+        engine_bin,
+        image,
+        output_root: Some(output_root),
+    })
+    .map_err(|error| (error, json))?;
+    render_sales_demo(&report, json);
     Ok(0)
+}
+
+fn resolve_container_engine(configured: Option<PathBuf>) -> Result<PathBuf, OpenWorkError> {
+    if let Some(path) =
+        configured.or_else(|| std::env::var_os("OPENWORK_DOCKER_BIN").map(PathBuf::from))
+    {
+        if path.is_absolute() && path.is_file() {
+            return Ok(path);
+        }
+        return Err(OpenWorkError::new(
+            ErrorCode::InvalidArguments,
+            "container engine path must be an existing absolute file",
+        ));
+    }
+    ["/usr/bin/docker", "/usr/local/bin/docker"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            OpenWorkError::new(
+                ErrorCode::SandboxUnavailable,
+                "Docker CLI was not found in a supported location",
+            )
+            .with_remediation("Pass --engine-bin with an absolute Docker-compatible CLI path.")
+        })
+}
+
+fn render_sales_demo(report: &SalesDemoReport, json: bool) {
+    if json {
+        let artifacts = report
+            .artifacts
+            .iter()
+            .map(|artifact| {
+                serde_json::json!({
+                    "path": artifact.path,
+                    "media_type": artifact.media_type,
+                    "size_bytes": artifact.size_bytes,
+                    "sha256": artifact.sha256,
+                })
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "run_id": report.run_id,
+                "status": report.status,
+                "revision": report.revision,
+                "artifacts": artifacts,
+                "audit_event_count": report.audit_events.len(),
+                "output_directory": report.output_directory,
+            }))
+            .unwrap_or_default()
+        );
+        return;
+    }
+    println!("OpenWork M1 sales demo succeeded");
+    println!("Run ID: {}", report.run_id);
+    println!("Status: {:?}", report.status);
+    if let Some(output) = &report.output_directory {
+        println!("Artifacts: {}", output.display());
+    }
+    println!("Audit events: {}", report.audit_events.len());
 }
 
 fn runtime_lockfile_path(host: &PlatformInfo) -> std::path::PathBuf {

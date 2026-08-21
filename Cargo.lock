@@ -896,9 +896,9 @@ dependencies = [
 
 [[package]]
 name = "http-body-util"
-version = "0.1.4"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9f41fd6a08e4d4ec69df65976da761afd5ad5e58a9d4acb46bd1c953a9e3ff2"
+checksum = "b021d93e26becf5dc7e1b75b1bed1fd93124b374ceb73f43d4d4eafec896a64a"
 dependencies = [
  "bytes",
  "futures-core",
@@ -1528,6 +1528,7 @@ dependencies = [
  "openwork-config",
  "openwork-core",
  "openwork-doctor",
+ "openwork-e2e",
  "openwork-execution",
  "openwork-installer",
  "openwork-platform",
@@ -1590,7 +1591,9 @@ version = "0.1.0"
 dependencies = [
  "openwork-core",
  "openwork-execution",
+ "openwork-policy",
  "openwork-runtime",
+ "openwork-sandbox",
  "serde",
  "serde_json",
  "sha2 0.11.0",

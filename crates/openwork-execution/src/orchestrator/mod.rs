@@ -124,6 +124,33 @@ impl<S: ExecutionStore> ExecutionOrchestrator<S> {
         actor: ActorId,
         now: UtcTimestamp,
     ) -> Result<Run, OpenWorkError> {
+        self.execute_with_output_processor(run, sandbox, request, actor, now, |_| Ok(()))
+    }
+
+    /// Executes a prepared request and requires provider output processing to
+    /// succeed before artifacts or a successful terminal state are accepted.
+    ///
+    /// Runtime integrations use this boundary to decode bounded provider
+    /// output into [`crate::RuntimeEvent`] values. Raw stdout/stderr remain
+    /// transient and are never appended to the audit store by this layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error and fails the run when request/result validation,
+    /// provider output processing, artifact scanning, sandbox execution, or
+    /// persistence fails.
+    pub fn execute_with_output_processor<F>(
+        &self,
+        run: &Run,
+        sandbox: &dyn SandboxBackend,
+        request: &SandboxRequest,
+        actor: ActorId,
+        now: UtcTimestamp,
+        process_output: F,
+    ) -> Result<Run, OpenWorkError>
+    where
+        F: FnOnce(&crate::SandboxResult) -> Result<(), OpenWorkError>,
+    {
         if run.id != request.run_id {
             return Err(OpenWorkError::new(
                 ErrorCode::ExecutionFailed,
@@ -172,6 +199,8 @@ impl<S: ExecutionStore> ExecutionOrchestrator<S> {
                     audit(actor.clone(), UtcTimestamp::now()),
                 );
             })?;
+
+        self.process_output_or_fail(&run, &result, &actor, process_output)?;
 
         // Scan output artifacts (only when the container exited cleanly)
         let completed_at = UtcTimestamp::now();
@@ -235,6 +264,27 @@ impl<S: ExecutionStore> ExecutionOrchestrator<S> {
     #[must_use]
     pub const fn store(&self) -> &S {
         &self.store
+    }
+
+    fn process_output_or_fail<F>(
+        &self,
+        run: &Run,
+        result: &crate::SandboxResult,
+        actor: &ActorId,
+        process_output: F,
+    ) -> Result<(), OpenWorkError>
+    where
+        F: FnOnce(&crate::SandboxResult) -> Result<(), OpenWorkError>,
+    {
+        process_output(result).inspect_err(|_| {
+            let _ = self.store.transition_run(
+                &run.id,
+                run.revision,
+                RunStatus::Failed,
+                Some("runtime output validation failed"),
+                audit(actor.clone(), UtcTimestamp::now()),
+            );
+        })
     }
 }
 

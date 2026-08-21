@@ -1,9 +1,15 @@
-//! Ephemeral, fail-closed Docker sandbox backend for M1 safe execution.
+//! Ephemeral, fail-closed container sandbox backend for M1 safe execution.
 
 mod cli;
+mod engine;
 mod filesystem;
 
-pub use cli::{CliOutput, DockerCli, SystemDockerCli};
+pub use cli::DockerCli as ContainerCli;
+pub use cli::{CliOutput, DockerCli, SystemDockerCli, SystemPodmanCli};
+pub use engine::{
+    CapabilitySupport, ContainerEngine, ContainerEngineCapabilities, ContainerEngineHealth,
+    ContainerEngineKind, ContainerEngineStatus, DockerEngine, PodmanEngine,
+};
 
 use filesystem::{OwnedTemporaryDirectory, collect_output_paths, mount_argument, validate_mount};
 use openwork_core::{ErrorCode, OpenWorkError};
@@ -14,7 +20,7 @@ use openwork_execution::{
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -23,6 +29,9 @@ use std::time::{Duration, Instant};
 const CONTROL_OUTPUT_LIMIT: u64 = 64 * 1024;
 const CLI_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const HEALTH_NOT_CHECKED: u8 = 0;
+const HEALTH_AVAILABLE: u8 = 1;
+const HEALTH_UNAVAILABLE: u8 = 2;
 
 #[derive(Debug)]
 struct ActiveContainer {
@@ -30,23 +39,62 @@ struct ActiveContainer {
     cancel_requested: AtomicBool,
 }
 
-/// Host-side backend that creates one disposable, networkless Docker container per request.
-pub struct DockerSandbox<C: DockerCli> {
+/// Host-side backend that creates one disposable, networkless container per request.
+pub struct ContainerSandbox<C: DockerCli, E: ContainerEngine> {
     cli: Arc<C>,
+    engine: E,
     temporary_root: PathBuf,
     active: Arc<Mutex<BTreeMap<String, Arc<ActiveContainer>>>>,
     poll_interval: Duration,
+    health: AtomicU8,
 }
 
-impl<C: DockerCli> DockerSandbox<C> {
+/// Backwards-compatible Docker sandbox name.
+pub type DockerSandbox<C> = ContainerSandbox<C, DockerEngine>;
+
+/// Podman-backed sandbox using the same lifecycle and security policy as Docker.
+pub type PodmanSandbox<C> = ContainerSandbox<C, PodmanEngine>;
+
+impl<C: DockerCli> ContainerSandbox<C, DockerEngine> {
     /// Creates a backend. `temporary_root` must be a backend-owned existing directory.
     #[must_use]
     pub fn new(cli: Arc<C>, temporary_root: PathBuf) -> Self {
+        Self::for_engine(cli, temporary_root, DockerEngine)
+    }
+}
+
+impl<C: DockerCli> ContainerSandbox<C, PodmanEngine> {
+    /// Creates a Podman backend. `temporary_root` must be a backend-owned existing directory.
+    #[must_use]
+    pub fn new(cli: Arc<C>, temporary_root: PathBuf) -> Self {
+        Self::for_engine(cli, temporary_root, PodmanEngine)
+    }
+}
+
+impl<C: DockerCli, E: ContainerEngine> ContainerSandbox<C, E> {
+    fn for_engine(cli: Arc<C>, temporary_root: PathBuf, engine: E) -> Self {
         Self {
             cli,
+            engine,
             temporary_root,
             active: Arc::new(Mutex::new(BTreeMap::new())),
             poll_interval: DEFAULT_POLL_INTERVAL,
+            health: AtomicU8::new(HEALTH_NOT_CHECKED),
+        }
+    }
+
+    /// Reports adapter capabilities and the result of the most recent health probe.
+    #[must_use]
+    pub fn engine_status(&self) -> ContainerEngineStatus {
+        let health = match self.health.load(Ordering::Acquire) {
+            HEALTH_AVAILABLE => ContainerEngineHealth::Available,
+            HEALTH_UNAVAILABLE => ContainerEngineHealth::Unavailable,
+            _ => ContainerEngineHealth::NotChecked,
+        };
+        ContainerEngineStatus {
+            kind: self.engine.kind(),
+            capabilities: self.engine.capabilities(),
+            health,
         }
     }
 
@@ -66,19 +114,20 @@ impl<C: DockerCli> DockerSandbox<C> {
         validate_mount(request.output_directory.as_path())?;
         let temporary = OwnedTemporaryDirectory::create(&self.temporary_root)?;
         let environment_file = temporary.write_environment(request.command.environment())?;
-        let create_args = create_arguments(request, &temporary, environment_file)?;
+        let create_args = create_arguments(self.engine, request, &temporary, environment_file)?;
         let create = self.invoke(&create_args, CONTROL_OUTPUT_LIMIT);
         let container_id = match temporary.read_container_id() {
             Ok(id) => id,
             Err(error) => return Err(create.err().unwrap_or(error)),
         };
-        let mut guard = ContainerGuard::new(Arc::clone(&self.cli), container_id.clone());
+        let mut guard =
+            ContainerGuard::new(Arc::clone(&self.cli), self.engine, container_id.clone());
         match create {
             Ok(output) if output.success => {}
             Ok(_) => {
                 return Err(sandbox_error(
                     ErrorCode::ExecutionFailed,
-                    "Docker container creation failed",
+                    "Container creation failed",
                 ));
             }
             Err(error) => return Err(error),
@@ -95,7 +144,7 @@ impl<C: DockerCli> DockerSandbox<C> {
             self.run_container(&container_id, &active, request)?;
         let logs = self
             .invoke(
-                &os_args(["logs", &container_id]),
+                &self.engine.logs_arguments(&container_id),
                 request.limits.max_output_bytes(),
             )
             .unwrap_or_else(|_| CliOutput {
@@ -140,7 +189,10 @@ impl<C: DockerCli> DockerSandbox<C> {
         active: &ActiveContainer,
         request: &SandboxRequest,
     ) -> Result<(SandboxTermination, Option<i32>), OpenWorkError> {
-        let start = self.invoke(&os_args(["start", container_id]), CONTROL_OUTPUT_LIMIT)?;
+        let start = self.invoke(
+            &self.engine.start_arguments(container_id),
+            CONTROL_OUTPUT_LIMIT,
+        )?;
         if !start.success {
             return Ok((SandboxTermination::Failed, None));
         }
@@ -152,7 +204,7 @@ impl<C: DockerCli> DockerSandbox<C> {
             let (attachment_sender, attachment_receiver) = std::sync::mpsc::sync_channel(1);
             let attachment_timeout =
                 Duration::from_secs(request.limits.timeout_seconds()).saturating_add(CLI_TIMEOUT);
-            let attachment_arguments = os_args(["attach", "--sig-proxy=false", container_id]);
+            let attachment_arguments = self.engine.attach_arguments(container_id);
             let cli = Arc::clone(&self.cli);
             let stdin = request.command.stdin();
             let attachment = scope.spawn(move || {
@@ -173,17 +225,20 @@ impl<C: DockerCli> DockerSandbox<C> {
 
     fn inspect(&self, container_id: &str) -> Result<ContainerState, OpenWorkError> {
         let output = self.invoke(
-            &os_args(["inspect", "--format", "{{json .State}}", container_id]),
+            &self.engine.inspect_arguments(container_id),
             CONTROL_OUTPUT_LIMIT,
         )?;
         if !output.success {
             return Err(sandbox_error(
                 ErrorCode::ExecutionFailed,
-                "Docker container inspection failed",
+                "Container inspection failed",
             ));
         }
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|_| {
-            sandbox_error(ErrorCode::ExecutionFailed, "Docker returned invalid state")
+            sandbox_error(
+                ErrorCode::ExecutionFailed,
+                "Container engine returned invalid state",
+            )
         })?;
         Ok(ContainerState {
             running: state_bool(&value, "Running")?,
@@ -193,7 +248,10 @@ impl<C: DockerCli> DockerSandbox<C> {
                 .and_then(serde_json::Value::as_i64)
                 .and_then(|code| i32::try_from(code).ok())
                 .ok_or_else(|| {
-                    sandbox_error(ErrorCode::ExecutionFailed, "Docker state omitted exit code")
+                    sandbox_error(
+                        ErrorCode::ExecutionFailed,
+                        "Container state omitted exit code",
+                    )
                 })?,
         })
     }
@@ -208,11 +266,17 @@ impl<C: DockerCli> DockerSandbox<C> {
         let mut attachment_failed = false;
         loop {
             if active.cancel_requested.load(Ordering::Acquire) {
-                let _ = self.invoke(&os_args(["kill", container_id]), CONTROL_OUTPUT_LIMIT);
+                let _ = self.invoke(
+                    &self.engine.kill_arguments(container_id),
+                    CONTROL_OUTPUT_LIMIT,
+                );
                 return (SandboxTermination::Cancelled, None);
             }
             if Instant::now() >= deadline {
-                let _ = self.invoke(&os_args(["kill", container_id]), CONTROL_OUTPUT_LIMIT);
+                let _ = self.invoke(
+                    &self.engine.kill_arguments(container_id),
+                    CONTROL_OUTPUT_LIMIT,
+                );
                 return (SandboxTermination::TimedOut, None);
             }
             if let Some(attachment) = attachment {
@@ -224,7 +288,10 @@ impl<C: DockerCli> DockerSandbox<C> {
             }
             match self.inspect(container_id) {
                 Ok(state) if state.running && attachment_failed => {
-                    let _ = self.invoke(&os_args(["kill", container_id]), CONTROL_OUTPUT_LIMIT);
+                    let _ = self.invoke(
+                        &self.engine.kill_arguments(container_id),
+                        CONTROL_OUTPUT_LIMIT,
+                    );
                     return (SandboxTermination::Failed, None);
                 }
                 Ok(state) if state.running => thread::sleep(self.poll_interval),
@@ -235,7 +302,10 @@ impl<C: DockerCli> DockerSandbox<C> {
                     return (SandboxTermination::Exited, Some(state.exit_code));
                 }
                 Err(_) => {
-                    let _ = self.invoke(&os_args(["kill", container_id]), CONTROL_OUTPUT_LIMIT);
+                    let _ = self.invoke(
+                        &self.engine.kill_arguments(container_id),
+                        CONTROL_OUTPUT_LIMIT,
+                    );
                     return (SandboxTermination::Failed, None);
                 }
             }
@@ -243,19 +313,24 @@ impl<C: DockerCli> DockerSandbox<C> {
     }
 }
 
-impl<C: DockerCli> SandboxBackend for DockerSandbox<C> {
+impl<C: DockerCli, E: ContainerEngine> SandboxBackend for ContainerSandbox<C, E> {
     fn health(&self) -> Result<(), OpenWorkError> {
-        let output = self.invoke(
-            &os_args(["version", "--format", "{{.Server.Version}}"]),
-            CONTROL_OUTPUT_LIMIT,
-        )?;
-        if output.success && !output.stdout.is_empty() {
-            Ok(())
-        } else {
-            Err(sandbox_error(
-                ErrorCode::SandboxUnavailable,
-                "Docker daemon is unavailable",
-            ))
+        match self.invoke(&self.engine.health_arguments(), CONTROL_OUTPUT_LIMIT) {
+            Ok(output) if output.success && !output.stdout.is_empty() => {
+                self.health.store(HEALTH_AVAILABLE, Ordering::Release);
+                Ok(())
+            }
+            Ok(_) => {
+                self.health.store(HEALTH_UNAVAILABLE, Ordering::Release);
+                Err(sandbox_error(
+                    ErrorCode::SandboxUnavailable,
+                    self.engine.unavailable_message(),
+                ))
+            }
+            Err(error) => {
+                self.health.store(HEALTH_UNAVAILABLE, Ordering::Release);
+                Err(error)
+            }
         }
     }
 
@@ -273,7 +348,10 @@ impl<C: DockerCli> SandboxBackend for DockerSandbox<C> {
             .cloned()
             .ok_or_else(|| sandbox_error(ErrorCode::RunCancelled, "run has no active sandbox"))?;
         active.cancel_requested.store(true, Ordering::Release);
-        let output = self.invoke(&os_args(["kill", &active.id]), CONTROL_OUTPUT_LIMIT)?;
+        let output = self.invoke(
+            &self.engine.kill_arguments(&active.id),
+            CONTROL_OUTPUT_LIMIT,
+        )?;
         if output.success {
             Ok(())
         } else {
@@ -294,7 +372,7 @@ impl<C: DockerCli> SandboxBackend for DockerSandbox<C> {
             .ok_or_else(|| {
                 sandbox_error(ErrorCode::ExecutionFailed, "run has no active sandbox")
             })?;
-        let mut guard = ContainerGuard::new(Arc::clone(&self.cli), active.id.clone());
+        let mut guard = ContainerGuard::new(Arc::clone(&self.cli), self.engine, active.id.clone());
         match guard.cleanup() {
             SandboxCleanupStatus::Succeeded => Ok(()),
             SandboxCleanupStatus::Failed { .. } => Err(sandbox_error(
@@ -353,16 +431,18 @@ impl Drop for ActiveRegistration {
     }
 }
 
-struct ContainerGuard<C: DockerCli> {
+struct ContainerGuard<C: DockerCli, E: ContainerEngine> {
     cli: Arc<C>,
+    engine: E,
     container_id: String,
     cleaned: bool,
 }
 
-impl<C: DockerCli> ContainerGuard<C> {
-    fn new(cli: Arc<C>, container_id: String) -> Self {
+impl<C: DockerCli, E: ContainerEngine> ContainerGuard<C, E> {
+    fn new(cli: Arc<C>, engine: E, container_id: String) -> Self {
         Self {
             cli,
+            engine,
             container_id,
             cleaned: false,
         }
@@ -370,13 +450,13 @@ impl<C: DockerCli> ContainerGuard<C> {
 
     fn cleanup(&mut self) -> SandboxCleanupStatus {
         let _ = self.cli.run(
-            &os_args(["kill", &self.container_id]),
+            &self.engine.kill_arguments(&self.container_id),
             CONTROL_OUTPUT_LIMIT,
             CLI_TIMEOUT,
             &[],
         );
         let removed = self.cli.run(
-            &os_args(["rm", "--force", &self.container_id]),
+            &self.engine.remove_arguments(&self.container_id),
             CONTROL_OUTPUT_LIMIT,
             CLI_TIMEOUT,
             &[],
@@ -386,13 +466,13 @@ impl<C: DockerCli> ContainerGuard<C> {
             SandboxCleanupStatus::Succeeded
         } else {
             SandboxCleanupStatus::Failed {
-                error_code: "docker.remove_failed".to_owned(),
+                error_code: self.engine.remove_failure_code().to_owned(),
             }
         }
     }
 }
 
-impl<C: DockerCli> Drop for ContainerGuard<C> {
+impl<C: DockerCli, E: ContainerEngine> Drop for ContainerGuard<C, E> {
     fn drop(&mut self) {
         if !self.cleaned {
             let _ = self.cleanup();
@@ -400,12 +480,13 @@ impl<C: DockerCli> Drop for ContainerGuard<C> {
     }
 }
 
-fn create_arguments(
+fn create_arguments<E: ContainerEngine>(
+    engine: E,
     request: &SandboxRequest,
     temporary: &OwnedTemporaryDirectory,
     environment_file: PathBuf,
 ) -> Result<Vec<OsString>, OpenWorkError> {
-    let mut args = os_args(["create", "--network", "none", "--read-only"]);
+    let mut args = engine.create_arguments();
     push_pair(&mut args, "--cap-drop", "ALL");
     push_pair(&mut args, "--security-opt", "no-new-privileges");
     push_pair(
@@ -503,10 +584,6 @@ fn combine_cleanup(
             error_code: "temporary.remove_failed".to_owned(),
         },
     }
-}
-
-fn os_args<const N: usize>(values: [&str; N]) -> Vec<OsString> {
-    values.into_iter().map(OsString::from).collect()
 }
 
 fn registry_error() -> OpenWorkError {

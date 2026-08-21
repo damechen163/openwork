@@ -8,12 +8,25 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use openwork_execution::ActorId;
+use openwork_execution::{
+    ActorId, ApprovalDecision, ApprovalId, ApprovalRequest, DEFAULT_MAX_ARTIFACT_BYTES, Run, RunId,
+    UtcTimestamp,
+    approval::ApprovalRepository,
+    artifact::ArtifactScanner,
+    orchestrator::ExecutionOrchestrator,
+    store::{ExecutionStore, postgres::PostgresExecutionStore},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, PgPool, postgres::PgPoolOptions};
-use std::{env, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    env, fs,
+    net::SocketAddr,
+    path::{Path as FsPath, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -26,6 +39,7 @@ pub struct Config {
     pub database_url: String,
     pub api_token: String,
     pub actor_id: String,
+    pub workspace_root: PathBuf,
 }
 
 impl Config {
@@ -50,11 +64,17 @@ impl Config {
             env::var("OPENWORK_API_ACTOR").unwrap_or_else(|_| "control-admin".to_owned());
         ActorId::parse(actor_id.clone())
             .map_err(|_| ConfigError("OPENWORK_API_ACTOR is invalid"))?;
+        let workspace_root = env::var_os("OPENWORK_WORKSPACE_ROOT")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .ok_or(ConfigError("OPENWORK_WORKSPACE_ROOT is required"))?;
+        let workspace_root = canonical_workspace_root(&workspace_root)?;
         Ok(Self {
             bind,
             database_url,
             api_token,
             actor_id,
+            workspace_root,
         })
     }
 }
@@ -64,6 +84,17 @@ fn required_env(name: &'static str) -> Result<String, ConfigError> {
         .ok()
         .filter(|value| !value.is_empty())
         .ok_or(ConfigError(name))
+}
+
+fn canonical_workspace_root(path: &FsPath) -> Result<PathBuf, ConfigError> {
+    let root = fs::canonicalize(path)
+        .map_err(|_| ConfigError("OPENWORK_WORKSPACE_ROOT must be an existing directory"))?;
+    if !fs::metadata(&root).is_ok_and(|metadata| metadata.is_dir()) {
+        return Err(ConfigError(
+            "OPENWORK_WORKSPACE_ROOT must be an existing directory",
+        ));
+    }
+    Ok(root)
 }
 
 #[derive(Debug)]
@@ -80,8 +111,10 @@ impl std::error::Error for ConfigError {}
 #[derive(Clone)]
 struct AppState {
     pool: PgPool,
+    store: PostgresExecutionStore,
     token_hash: [u8; 32],
     actor_id: String,
+    workspace_root: PathBuf,
 }
 
 /// Runs migrations and serves the Control API.
@@ -96,16 +129,34 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .connect(&config.database_url)
         .await?;
     MIGRATIONS.run(&pool).await?;
+    let recovery_actor = ActorId::parse(config.actor_id.clone())?;
+    PostgresExecutionStore::new(pool.clone())
+        .recover_interrupted_runs(recovery_actor, UtcTimestamp::now())?;
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
-    axum::serve(listener, router(pool, &config.api_token, config.actor_id)).await?;
+    axum::serve(
+        listener,
+        router(
+            pool,
+            &config.api_token,
+            config.actor_id,
+            config.workspace_root,
+        ),
+    )
+    .await?;
     Ok(())
 }
 
-pub fn router(pool: PgPool, api_token: &str, actor_id: String) -> Router {
+/// Builds the authenticated API around one Postgres store and trusted workspace root.
+///
+/// `workspace_root` must already be canonical. Production callers should use
+/// [`Config::from_env`], which enforces that invariant.
+pub fn router(pool: PgPool, api_token: &str, actor_id: String, workspace_root: PathBuf) -> Router {
     let state = Arc::new(AppState {
+        store: PostgresExecutionStore::new(pool.clone()),
         pool,
         token_hash: Sha256::digest(api_token.as_bytes()).into(),
         actor_id,
+        workspace_root,
     });
     let protected = Router::new()
         .route("/runs", post(create_run))
@@ -114,6 +165,7 @@ pub fn router(pool: PgPool, api_token: &str, actor_id: String) -> Router {
         .route("/runs/{id}/events", get(list_events))
         .route("/runs/{id}/artifacts", get(list_artifacts))
         .route("/approvals", get(list_approvals))
+        .route("/approvals/{id}", get(get_approval))
         .route("/approvals/{id}/approve", post(approve))
         .route("/approvals/{id}/deny", post(deny))
         .layer(DefaultBodyLimit::max(256 * 1024))
@@ -188,35 +240,27 @@ struct CreateRun {
     prompt: String,
 }
 
-#[derive(Serialize, FromRow)]
-struct RunResponse {
-    schema_version: i32,
-    id: Uuid,
-    runtime: String,
-    workspace: String,
-    status: String,
-    revision: i64,
-    actor_id: String,
-    prompt_sha256: String,
-    #[serde(with = "time::serde::rfc3339")]
-    created_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    updated_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339::option")]
-    started_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339::option")]
-    completed_at: Option<OffsetDateTime>,
-    terminal_reason: Option<String>,
-}
-
 async fn create_run(
-    Extension(_actor): Extension<AuthActor>,
+    State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<AuthActor>,
     Json(request): Json<CreateRun>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<(StatusCode, Json<Run>), ApiError> {
     validate_create_run(&request)?;
-    // Run creation must atomically persist the genesis audit event. The M1
-    // orchestrator owns that transaction and is injected in the integration wave.
-    Err(ApiError::unavailable("run_orchestrator_unavailable"))
+    let workspace = resolve_workspace(&state.workspace_root, &request.workspace)?;
+    let trusted_actor = ActorId::parse(actor.0).map_err(|_| ApiError::internal())?;
+    let scanner =
+        ArtifactScanner::new(DEFAULT_MAX_ARTIFACT_BYTES).map_err(|_| ApiError::internal())?;
+    let orchestrator = ExecutionOrchestrator::new(state.store.clone(), scanner);
+    let run = orchestrator
+        .create_run(
+            &request.runtime,
+            &workspace,
+            trusted_actor,
+            &request.prompt,
+            UtcTimestamp::now(),
+        )
+        .map_err(|_| ApiError::internal())?;
+    Ok((StatusCode::CREATED, Json(run)))
 }
 
 fn validate_create_run(request: &CreateRun) -> Result<(), ApiError> {
@@ -244,24 +288,31 @@ fn validate_create_run(request: &CreateRun) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn resolve_workspace(root: &FsPath, workspace: &str) -> Result<PathBuf, ApiError> {
+    let candidate = fs::canonicalize(root.join(workspace))
+        .map_err(|_| ApiError::invalid("workspace_unavailable"))?;
+    if candidate == root
+        || !candidate.starts_with(root)
+        || !fs::metadata(&candidate).is_ok_and(|metadata| metadata.is_dir())
+    {
+        return Err(ApiError::invalid("invalid_workspace_id"));
+    }
+    Ok(candidate)
+}
+
 async fn get_run(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
-) -> Result<Json<RunResponse>, ApiError> {
+) -> Result<Json<Run>, ApiError> {
     let id = validate_execution_id(id)?;
-    fetch_run(&state.pool, id).await.map(Json)
-}
-
-async fn fetch_run(pool: &PgPool, id: Uuid) -> Result<RunResponse, ApiError> {
-    sqlx::query_as::<_, RunResponse>(concat!(
-        "SELECT 1 AS schema_version,id,runtime,workspace,status::text AS status,revision,actor_id,",
-        "prompt_sha256::text,created_at,updated_at,started_at,completed_at,terminal_reason ",
-        "FROM runs WHERE id=$1"
-    ))
-    .bind(id)
-    .fetch_optional(pool)
-    .await?
-    .ok_or(ApiError::not_found("run_not_found"))
+    let run_id =
+        RunId::parse(&id.to_string()).map_err(|_| ApiError::invalid("invalid_execution_id"))?;
+    state
+        .store
+        .get_run(&run_id)
+        .map_err(|_| ApiError::internal())?
+        .map(Json)
+        .ok_or(ApiError::not_found("run_not_found"))
 }
 
 async fn cancel_run(
@@ -270,57 +321,35 @@ async fn cancel_run(
 ) -> Result<Json<Value>, ApiError> {
     let _id = validate_execution_id(id)?;
     // Never claim cancellation until the orchestrator has stopped runtime and sandbox.
-    Err(ApiError::unavailable("run_orchestrator_unavailable"))
-}
-
-#[derive(Serialize, FromRow)]
-struct ArtifactResponse {
-    schema_version: i32,
-    id: Uuid,
-    run_id: Uuid,
-    path: String,
-    media_type: String,
-    size_bytes: i64,
-    sha256: String,
-    #[serde(with = "time::serde::rfc3339")]
-    created_at: OffsetDateTime,
+    Err(ApiError::unavailable("run_cancellation_unavailable"))
 }
 
 async fn list_artifacts(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Vec<ArtifactResponse>>, ApiError> {
+) -> Result<Json<Vec<openwork_execution::Artifact>>, ApiError> {
     let id = validate_execution_id(id)?;
-    let rows = sqlx::query_as::<_, ArtifactResponse>(
-        "SELECT 1 AS schema_version,id,run_id,path,media_type,size_bytes,sha256::text,created_at FROM artifacts WHERE run_id=$1 ORDER BY created_at,id"
-    ).bind(id).fetch_all(&state.pool).await?;
-    Ok(Json(rows))
-}
-
-#[derive(Serialize, FromRow)]
-struct EventResponse {
-    schema_version: i32,
-    id: Uuid,
-    run_id: Uuid,
-    sequence: i64,
-    event_type: String,
-    actor: String,
-    #[serde(with = "time::serde::rfc3339")]
-    timestamp: OffsetDateTime,
-    metadata: Value,
-    previous_hash: Option<String>,
-    event_hash: String,
+    let run_id =
+        RunId::parse(&id.to_string()).map_err(|_| ApiError::invalid("invalid_execution_id"))?;
+    state
+        .store
+        .artifacts(&run_id)
+        .map(Json)
+        .map_err(|_| ApiError::internal())
 }
 
 async fn list_events(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Vec<EventResponse>>, ApiError> {
+) -> Result<Json<Vec<openwork_execution::AuditEvent>>, ApiError> {
     let id = validate_execution_id(id)?;
-    let rows = sqlx::query_as::<_, EventResponse>(
-        "SELECT 1 AS schema_version,id,run_id,sequence,event_type,actor_id AS actor,occurred_at AS timestamp,redacted_metadata AS metadata,previous_hash::text,event_hash::text FROM audit_events WHERE run_id=$1 ORDER BY sequence"
-    ).bind(id).fetch_all(&state.pool).await?;
-    Ok(Json(rows))
+    let run_id =
+        RunId::parse(&id.to_string()).map_err(|_| ApiError::invalid("invalid_execution_id"))?;
+    state
+        .store
+        .audit_events(&run_id)
+        .map(Json)
+        .map_err(|_| ApiError::internal())
 }
 
 #[derive(Serialize, FromRow)]
@@ -356,6 +385,19 @@ async fn list_approvals(
     Ok(Json(rows))
 }
 
+async fn get_approval(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ApprovalRequest>, ApiError> {
+    let approval_id = parse_approval_id(id)?;
+    state
+        .store
+        .get_approval(&approval_id)
+        .map_err(|_| ApiError::internal())?
+        .map(Json)
+        .ok_or(ApiError::not_found("approval_not_found"))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DecisionRequest {
@@ -364,40 +406,67 @@ struct DecisionRequest {
 }
 
 async fn approve(
-    _state: State<Arc<AppState>>,
+    state: State<Arc<AppState>>,
     actor: Extension<AuthActor>,
     path: Path<Uuid>,
     body: Json<DecisionRequest>,
-) -> Result<Json<Value>, ApiError> {
-    unavailable_decision(actor, path, body)
+) -> Result<Json<ApprovalRequest>, ApiError> {
+    decide_approval(state, actor, path, body, ApprovalDecision::Approved)
 }
 
 async fn deny(
-    _state: State<Arc<AppState>>,
+    state: State<Arc<AppState>>,
     actor: Extension<AuthActor>,
     path: Path<Uuid>,
     body: Json<DecisionRequest>,
-) -> Result<Json<Value>, ApiError> {
-    unavailable_decision(actor, path, body)
+) -> Result<Json<ApprovalRequest>, ApiError> {
+    decide_approval(state, actor, path, body, ApprovalDecision::Denied)
 }
 
-fn unavailable_decision(
+fn decide_approval(
+    State(state): State<Arc<AppState>>,
     Extension(actor): Extension<AuthActor>,
     Path(id): Path<Uuid>,
     Json(request): Json<DecisionRequest>,
-) -> Result<Json<Value>, ApiError> {
-    let _id = validate_execution_id(id)?;
-    if request.expected_revision < 0
-        || request
-            .reason
-            .as_ref()
-            .is_some_and(|reason| reason.len() > 2048)
+    decision: ApprovalDecision,
+) -> Result<Json<ApprovalRequest>, ApiError> {
+    let approval_id = parse_approval_id(id)?;
+    let expected_revision = u64::try_from(request.expected_revision)
+        .map_err(|_| ApiError::invalid("invalid_revision"))?;
+    if request
+        .reason
+        .as_ref()
+        .is_some_and(|reason| reason.len() > 2048)
         || actor.0.is_empty()
     {
-        return Err(ApiError::invalid("invalid_revision"));
+        return Err(ApiError::invalid("invalid_decision_request"));
     }
-    // Decision and matching audit event are one policy-owned transaction.
-    Err(ApiError::unavailable("approval_service_unavailable"))
+    if state
+        .store
+        .get_approval(&approval_id)
+        .map_err(|_| ApiError::internal())?
+        .is_none()
+    {
+        return Err(ApiError::not_found("approval_not_found"));
+    }
+    let trusted_actor = ActorId::parse(actor.0).map_err(|_| ApiError::internal())?;
+    state
+        .store
+        .decide_approval(
+            &approval_id,
+            expected_revision,
+            decision,
+            trusted_actor,
+            request.reason.as_deref(),
+            UtcTimestamp::now(),
+        )
+        .map(Json)
+        .map_err(|_| ApiError::conflict("approval_decision_rejected"))
+}
+
+fn parse_approval_id(id: Uuid) -> Result<ApprovalId, ApiError> {
+    let id = validate_execution_id(id)?;
+    ApprovalId::parse(&id.to_string()).map_err(|_| ApiError::invalid("invalid_execution_id"))
 }
 
 fn validate_execution_id(id: Uuid) -> Result<Uuid, ApiError> {
@@ -421,6 +490,9 @@ impl ApiError {
     const fn invalid(code: &'static str) -> Self {
         Self(StatusCode::UNPROCESSABLE_ENTITY, code)
     }
+    const fn conflict(code: &'static str) -> Self {
+        Self(StatusCode::CONFLICT, code)
+    }
     const fn unavailable(code: &'static str) -> Self {
         Self(StatusCode::SERVICE_UNAVAILABLE, code)
     }
@@ -438,5 +510,114 @@ impl From<sqlx::Error> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.0, Json(json!({"error": self.1}))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Method, Request},
+    };
+    use tower::ServiceExt;
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    fn test_router(root: PathBuf) -> Router {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://openwork:openwork@127.0.0.1:9/openwork")
+            .expect("valid test database URL");
+        router(pool, TOKEN, "test:control".to_owned(), root)
+    }
+
+    fn request(method: Method, uri: &str, body: &str, authenticated: bool) -> Request<Body> {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if authenticated {
+            builder = builder.header("authorization", format!("Bearer {TOKEN}"));
+        }
+        if !body.is_empty() {
+            builder = builder.header("content-type", "application/json");
+        }
+        builder
+            .body(Body::from(body.to_owned()))
+            .expect("valid request")
+    }
+
+    #[tokio::test]
+    async fn protected_routes_require_bearer_authentication_before_database_access() {
+        let response = test_router(PathBuf::from("."))
+            .oneshot(request(Method::GET, "/v1/approvals", "", false))
+            .await
+            .expect("router response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn create_run_rejects_unsafe_workspace_before_database_access() {
+        let response = test_router(PathBuf::from("."))
+            .oneshot(request(
+                Method::POST,
+                "/v1/runs",
+                r#"{"runtime":"mock","workspace":"../escape","prompt":"secret"}"#,
+                true,
+            ))
+            .await
+            .expect("router response");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn cancellation_fails_closed_until_runtime_cancellation_is_integrated() {
+        let run_id = Uuid::now_v7();
+        let response = test_router(PathBuf::from("."))
+            .oneshot(request(
+                Method::POST,
+                &format!("/v1/runs/{run_id}/cancel"),
+                "",
+                true,
+            ))
+            .await
+            .expect("router response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn approval_detail_and_decision_reject_non_v7_ids_before_database_access() {
+        let invalid_id = Uuid::nil();
+        for (method, uri, body) in [
+            (
+                Method::GET,
+                format!("/v1/approvals/{invalid_id}"),
+                String::new(),
+            ),
+            (
+                Method::POST,
+                format!("/v1/approvals/{invalid_id}/approve"),
+                r#"{"expected_revision":0}"#.to_owned(),
+            ),
+        ] {
+            let response = test_router(PathBuf::from("."))
+                .oneshot(request(method, &uri, &body, true))
+                .await
+                .expect("router response");
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+    }
+
+    #[test]
+    fn workspace_resolution_is_root_bounded_and_requires_a_directory() {
+        let root = env::temp_dir().join(format!("openwork-control-api-{}", Uuid::now_v7()));
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).expect("create workspace fixture");
+        let canonical_root = fs::canonicalize(&root).expect("canonical root");
+
+        assert_eq!(
+            resolve_workspace(&canonical_root, "workspace").expect("valid workspace"),
+            fs::canonicalize(&workspace).expect("canonical workspace")
+        );
+        assert!(resolve_workspace(&canonical_root, "missing").is_err());
+
+        fs::remove_dir_all(&root).expect("remove workspace fixture");
     }
 }

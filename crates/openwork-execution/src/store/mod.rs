@@ -1,5 +1,6 @@
 //! Transactional execution persistence boundary and deterministic memory store.
 
+use crate::action_executor::ActionExecutionReceipt;
 use crate::approval::{ActionClaim, ApprovalConsumption, ApprovalRepository};
 use crate::audit::AuditAppend;
 use crate::{
@@ -47,6 +48,21 @@ pub trait ExecutionStore: Send + Sync {
         event_type: AuditEventType,
         audit: AuditAppend,
     ) -> Result<AuditEvent, OpenWorkError>;
+    /// Atomically appends one exact action-executed receipt if absent.
+    ///
+    /// Returns `true` when this call appended the event and `false` when the
+    /// exact receipt was already audited. Implementations must serialize the
+    /// check and append so concurrent reconciliation cannot create duplicates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a missing/mismatched durable action claim,
+    /// conflicting receipt, invalid audit chain, or storage failure.
+    fn reconcile_action_execution(
+        &self,
+        receipt: &ActionExecutionReceipt,
+        audit: AuditAppend,
+    ) -> Result<bool, OpenWorkError>;
     /// Persists a complete artifact batch or none of it.
     ///
     /// # Errors
@@ -205,6 +221,49 @@ impl ExecutionStore for InMemoryExecutionStore {
         Ok(event)
     }
 
+    fn reconcile_action_execution(
+        &self,
+        receipt: &ActionExecutionReceipt,
+        audit: AuditAppend,
+    ) -> Result<bool, OpenWorkError> {
+        let mut state = self.lock()?;
+        verify_execution_claim(&state, receipt)?;
+        let events = state
+            .audits
+            .get(&receipt.run_id)
+            .ok_or_else(audit_missing)?;
+        if execution_receipt_was_audited(events, receipt)? {
+            return Ok(false);
+        }
+        if events
+            .last()
+            .is_some_and(|event| audit.timestamp < event.timestamp)
+        {
+            return Err(state_error(
+                "action execution audit timestamp moved backwards",
+            ));
+        }
+        let sequence = u64::try_from(events.len())
+            .map_err(|_| internal_error("audit sequence overflow"))?
+            .checked_add(1)
+            .ok_or_else(|| internal_error("audit sequence overflow"))?;
+        let previous = events.last().map(|event| event.event_hash().clone());
+        let event = audit
+            .with_action_execution(receipt.action_id.clone(), receipt.parameter_hash.clone())
+            .build(
+                receipt.run_id.clone(),
+                sequence,
+                AuditEventType::ActionExecuted,
+                previous,
+            )?;
+        state
+            .audits
+            .get_mut(&receipt.run_id)
+            .ok_or_else(audit_missing)?
+            .push(event);
+        Ok(true)
+    }
+
     fn record_artifacts(
         &self,
         run_id: &RunId,
@@ -298,6 +357,58 @@ impl ExecutionStore for InMemoryExecutionStore {
             .get(run_id)
             .cloned()
             .unwrap_or_default())
+    }
+}
+
+fn verify_execution_claim(
+    state: &State,
+    receipt: &ActionExecutionReceipt,
+) -> Result<(), OpenWorkError> {
+    let claim = state
+        .action_claims
+        .get(&receipt.action_id)
+        .ok_or_else(|| approval_error("action execution has no durable claim"))?;
+    if claim.run_id != receipt.run_id || claim.parameter_hash != receipt.parameter_hash {
+        return Err(approval_error(
+            "action execution receipt does not match its durable claim",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn execution_receipt_was_audited(
+    events: &[AuditEvent],
+    receipt: &ActionExecutionReceipt,
+) -> Result<bool, OpenWorkError> {
+    let expected_action_id = receipt.action_id.to_hyphenated();
+    let expected_hash = receipt.parameter_hash.as_str();
+    let mut exact_matches = 0_u8;
+    for event in events {
+        if event.event_type != AuditEventType::ActionExecuted {
+            continue;
+        }
+        let metadata = event.metadata.as_map();
+        let action_id = metadata
+            .get("action_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| approval_error("action execution audit metadata is invalid"))?;
+        let parameter_hash = metadata
+            .get("parameter_hash")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| approval_error("action execution audit metadata is invalid"))?;
+        if action_id == expected_action_id {
+            if event.run_id != receipt.run_id || parameter_hash != expected_hash {
+                return Err(approval_error("action execution audit binding is invalid"));
+            }
+            exact_matches = exact_matches
+                .checked_add(1)
+                .ok_or_else(|| approval_error("duplicate action execution audit"))?;
+        }
+    }
+    match exact_matches {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(approval_error("duplicate action execution audit")),
     }
 }
 

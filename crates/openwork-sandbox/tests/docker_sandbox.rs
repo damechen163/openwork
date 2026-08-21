@@ -3,7 +3,10 @@ use openwork_execution::{
     ApprovedMountDirectory, DigestPinnedImageRef, RunId, SandboxBackend, SandboxCleanupStatus,
     SandboxCommand, SandboxLimits, SandboxRequest, SandboxTermination, SandboxUser,
 };
-use openwork_sandbox::{CliOutput, DockerCli, DockerSandbox};
+use openwork_sandbox::{
+    CapabilitySupport, CliOutput, ContainerEngineHealth, ContainerEngineKind, DockerCli,
+    DockerSandbox, PodmanSandbox,
+};
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::fs;
@@ -112,6 +115,7 @@ impl DockerCli for FakeDockerCli {
         }
         match args.first().map(String::as_str) {
             Some("version") => Ok(output(true, b"27.0.0".to_vec(), max_output_bytes)),
+            Some("info") => Ok(output(true, b"5.6.0".to_vec(), max_output_bytes)),
             Some("create") => {
                 let cidfile = argument_after(&args, "--cidfile");
                 fs::write(&cidfile, CONTAINER_ID).expect("fake cidfile");
@@ -191,6 +195,26 @@ fn output(success: bool, bytes: Vec<u8>, limit: u64) -> CliOutput {
 fn argument_after(args: &[String], flag: &str) -> PathBuf {
     let index = args.iter().position(|value| value == flag).expect("flag");
     PathBuf::from(args.get(index + 1).expect("flag value"))
+}
+
+fn normalized_create(arguments: &[String]) -> Vec<String> {
+    let mut normalized = Vec::with_capacity(arguments.len());
+    let mut replace_next = false;
+    for argument in arguments {
+        if replace_next {
+            normalized.push("<engine-owned-path>".to_owned());
+            replace_next = false;
+        } else if matches!(argument.as_str(), "--cidfile" | "--env-file") {
+            normalized.push(argument.clone());
+            replace_next = true;
+        } else if argument.starts_with("type=bind,src=") {
+            let target = argument.find(",dst=").expect("mount target");
+            normalized.push(format!("type=bind,src=<approved>{}", &argument[target..]));
+        } else {
+            normalized.push(argument.clone());
+        }
+    }
+    normalized
 }
 
 struct Fixture {
@@ -519,16 +543,72 @@ fn mount_replaced_by_symlink_after_approval_fails_closed() {
 }
 
 #[test]
-fn health_requires_a_server_response() {
+fn docker_and_podman_adapters_share_hardened_lifecycle() {
     let fixture = fixture(2, 1024);
-    let backend = DockerSandbox::new(Arc::new(FakeDockerCli::successful()), fixture.temporary);
-    backend.health().expect("healthy fake Docker daemon");
+    let docker_cli = Arc::new(FakeDockerCli::successful());
+    let docker = DockerSandbox::new(Arc::clone(&docker_cli), fixture.temporary.clone())
+        .with_poll_interval(Duration::ZERO);
+    assert_eq!(docker.engine_status().kind, ContainerEngineKind::Docker);
+    assert_eq!(
+        docker.engine_status().health,
+        ContainerEngineHealth::NotChecked
+    );
+    docker.health().expect("healthy fake Docker daemon");
+    docker.execute(&fixture.request).expect("Docker lifecycle");
+
+    let podman_cli = Arc::new(FakeDockerCli::successful());
+    let podman = PodmanSandbox::new(Arc::clone(&podman_cli), fixture.temporary.clone())
+        .with_poll_interval(Duration::ZERO);
+    let podman_status = podman.engine_status();
+    assert_eq!(podman_status.kind, ContainerEngineKind::Podman);
+    assert_eq!(podman_status.health, ContainerEngineHealth::NotChecked);
+    assert_eq!(
+        podman_status.capabilities.resource_limits,
+        CapabilitySupport::HostDependent
+    );
+    podman.health().expect("healthy fake Podman engine");
+    podman.execute(&fixture.request).expect("Podman lifecycle");
+
+    assert_eq!(
+        docker.engine_status().health,
+        ContainerEngineHealth::Available
+    );
+    assert_eq!(
+        podman.engine_status().health,
+        ContainerEngineHealth::Available
+    );
+    let docker_calls = docker_cli.commands();
+    let podman_calls = podman_cli.commands();
+    assert_eq!(
+        docker_calls.first().unwrap(),
+        &["version", "--format", "{{.Server.Version}}"]
+    );
+    assert_eq!(
+        podman_calls.first().unwrap(),
+        &["info", "--format", "{{.Version.Version}}"]
+    );
+    let docker_create = docker_calls
+        .iter()
+        .find(|call| call.first().is_some_and(|name| name == "create"))
+        .expect("Docker create");
+    let podman_create = podman_calls
+        .iter()
+        .find(|call| call.first().is_some_and(|name| name == "create"))
+        .expect("Podman create");
+    assert_eq!(
+        normalized_create(docker_create),
+        normalized_create(podman_create)
+    );
+    for command in ["start", "inspect", "logs", "kill", "rm"] {
+        assert!(docker_cli.command_names().contains(&command.to_owned()));
+        assert!(podman_cli.command_names().contains(&command.to_owned()));
+    }
 }
 
 #[cfg(unix)]
 #[test]
 fn system_cli_clears_environment_and_bounds_output() {
-    use openwork_sandbox::SystemDockerCli;
+    use openwork_sandbox::{SystemDockerCli, SystemPodmanCli};
     let cli = SystemDockerCli::new(PathBuf::from("/usr/bin/env"))
         .expect("absolute executable")
         .with_cli_environment(OsString::from("EXPLICIT"), OsString::from("visible"));
@@ -557,4 +637,8 @@ fn system_cli_clears_environment_and_bounds_output() {
         .run(&[OsString::from("2")], 16, Duration::from_millis(10), &[])
         .unwrap_err();
     assert_eq!(timeout.code, ErrorCode::RunTimedOut);
+
+    let podman = SystemPodmanCli::new(PathBuf::from("relative/podman")).unwrap_err();
+    assert_eq!(podman.code, ErrorCode::InvalidArguments);
+    assert_eq!(podman.message, "Podman executable must be an absolute path");
 }

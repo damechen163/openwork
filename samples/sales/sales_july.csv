@@ -1,6 +1,6 @@
-customer_id,customer_name,sales
-C001,Acme,8000
-C002,Beta,5000
-C003,Crown,7000
-C004,Delta,4000
-C005,Echo,9000
+customer_id,customer_name,sales,orders
+C001,Acme,8000,80
+C002,Beta,5000,50
+C003,Crown,7000,70
+C004,Delta,4000,40
+C005,Echo,9000,90
