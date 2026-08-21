@@ -17,6 +17,22 @@ Executed once via `openwork run --workspace /tmp/ow-demo/sales --timeout 300 "<p
 
 See the CLI demo steps and the GUI acceptance path in the following sections.
 
+## Via the Admin Web GUI
+
+The same acceptance gate is available in the dashboard:
+
+```bash
+cd apps/admin-web
+npm install
+export OPENWORK_BIN=/abs/path/to/target/release/openwork
+npm run dev   # or: npm run build && npx electron .
+```
+
+1. Open **Run Task**, enter the workspace path and the prompt above.
+2. Watch the terminal stream the three phases
+   (`runtime phase → sandbox phase → recording phase`).
+3. The report card shows `SUCCEEDED` and both artifacts with digest prefixes.
+
 ## Failure modes
 
 | Symptom | Cause | Fix |

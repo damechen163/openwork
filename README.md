@@ -6,14 +6,17 @@ Install once. Give every employee a private AI assistant with company knowledge,
 business tools, and safe execution.
 
 [中文](README.zh-CN.md) · [Getting started](docs/getting-started.md) ·
-[Deploy for a client](docs/deploy-for-client.md) · [Build a pack](docs/packs/build-your-first-pack.md)
+[Deployment guide](DEPLOYMENT.md) · [Deploy for a client](docs/deploy-for-client.md) ·
+[Build a pack](docs/packs/build-your-first-pack.md)
 
-> Status: the M1 completion work is under integration. A real-container sales
-> demo, Postgres control state, policy/approval/action controls, artifacts, and
-> hash-chain audit are implemented. Durable worker leases and fail-closed
-> cancellation intent are implemented; the generic worker execution loop and
-> secure prompt delivery are still missing. See the evidence-scoped
+> Status: M1 safe execution is complete on the real-host CLI path. A
+> real-container sales demo, Postgres control state, policy/approval/action
+> controls, artifacts, and hash-chain audit are implemented; the generic
+> worker execution loop (openwork run) and secure prompt delivery are also
+> implemented and verified on a clean host. Durable worker leases and
+> fail-closed cancellation intent are implemented. See the evidence-scoped
 > [current state](CURRENT_STATE.md).
+=======
 
 ## What employees will be able to do
 
@@ -44,6 +47,28 @@ cargo build --release
 ./target/release/openwork doctor --json
 ./target/release/openwork install --dry-run --json
 ```
+
+## Real AI task end to end (safe execution)
+
+```bash
+rm -rf /tmp/ow-demo && mkdir -p /tmp/ow-demo && cp -r samples/sales /tmp/ow-demo/
+./target/release/openwork run \
+  --workspace /tmp/ow-demo/sales \
+  "Read README.md and implement analyze.py exactly per the task contract. Do not run any commands."
+```
+
+One `openwork run`: Claude Code writes `analyze.py` on the host (networked),
+OpenWork executes it in a podman sandbox (`--network=none --read-only
+--user 1000:1000`), and the outputs (`sales-analysis.csv` / `summary.md`) are
+recorded with SHA-256 into the audit chain — final status `Succeeded`.
+Requires podman ≥ 6 and an authenticated Claude Code; full steps in the
+[deployment guide](DEPLOYMENT.md) and the [real-host demo](docs/demo/safe-execution.md).
+
+## Admin Web dashboard
+
+[apps/admin-web/](apps/admin-web/README.md) is the Electron + React + TypeScript
+dashboard: Dashboard, Run Task (live progress + artifact table), Install,
+Doctor, and Runtimes. See its [README](apps/admin-web/README.md) to launch.
 
 Release archives for the five native Tier 1 build targets are installed by the
 checksum-verifying [POSIX](scripts/install.sh) and [PowerShell](scripts/install.ps1)
