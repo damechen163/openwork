@@ -49,6 +49,46 @@ jobs:
       - uses: actions/checkout@v4
       - run: cargo test --workspace --tests --locked
 
+  real-docker-e2e:
+    name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: real-docker-e2e' || 'real-docker-e2e' }}"
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    env:
+      OPENWORK_REAL_DOCKER_TESTS: '1'
+      OPENWORK_DOCKER_BIN: /usr/bin/docker
+      OPENWORK_SALES_SANDBOX_IMAGE: docker.io/library/busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pull the digest-pinned analyzer image
+        run: docker pull "$OPENWORK_SALES_SANDBOX_IMAGE"
+      - name: Run the real Docker sandbox lifecycle
+        run: cargo test -p openwork-e2e --test real_docker_sales --locked -- --ignored --nocapture
+
+  postgres-concurrency:
+    name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: postgres-concurrency' || 'postgres-concurrency' }}"
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17.6-bookworm@sha256:f3bd19c606e442c3d7bdfa8002e03fe260a1023351e0ea4598032022b68dd6e3
+        env:
+          POSTGRES_DB: openwork_test
+          POSTGRES_USER: openwork
+          POSTGRES_PASSWORD: openwork-test-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U openwork -d openwork_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+    env:
+      OPENWORK_TEST_DATABASE_URL: postgresql://openwork:openwork-test-password@127.0.0.1:5432/openwork_test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run real Postgres CAS and recovery races
+        run: cargo test -p openwork-execution --features postgres --test postgres_concurrency --locked -- --nocapture
+
   build:
     name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: build' || 'build' }}"
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
@@ -73,7 +113,33 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: test ! -f installer/compose/compose.test.yml
+      - name: Validate the production Compose model
+        env:
+          OPENWORK_DB_PASSWORD: compose-smoke-password
+          OPENWORK_API_TOKEN: compose-smoke-token-0123456789abcdef
+          OPENWORK_HOST_WORKSPACE_ROOT: ${{ github.workspace }}/samples
+        run: docker compose -f compose/compose.yaml config --quiet
+      - name: Start Postgres and the Control API
+        env:
+          OPENWORK_DB_PASSWORD: compose-smoke-password
+          OPENWORK_API_TOKEN: compose-smoke-token-0123456789abcdef
+          OPENWORK_HOST_WORKSPACE_ROOT: ${{ github.workspace }}/samples
+        run: |
+          trap 'docker compose -f compose/compose.yaml down --volumes' EXIT
+          docker compose -f compose/compose.yaml up --detach --build --wait postgres openwork-control-api
+          curl --fail --silent --show-error http://127.0.0.1:8080/health
+          run_json=$(curl --fail --silent --show-error \
+            --header 'Authorization: Bearer compose-smoke-token-0123456789abcdef' \
+            --header 'Content-Type: application/json' \
+            --data '{"runtime":"codex","workspace":"sales","prompt":"compose smoke prompt"}' \
+            http://127.0.0.1:8080/v1/runs)
+          run_id=$(jq -er '.id' <<<"$run_json")
+          test "$(jq -r '.status' <<<"$run_json")" = queued
+          test "$(jq -r 'has("prompt")' <<<"$run_json")" = false
+          curl --fail --silent --show-error \
+            --header 'Authorization: Bearer compose-smoke-token-0123456789abcdef' \
+            "http://127.0.0.1:8080/v1/runs/$run_id/events" \
+            | jq -e 'length == 1 and .[0].event_type == "run_created"'
 
   pack-validation:
     name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: pack-validation' || 'pack-validation' }}"
@@ -115,10 +181,19 @@ jobs:
     name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: codeql-or-sast' || 'codeql-or-sast' }}"
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      packages: read
     steps:
       - uses: actions/checkout@v4
-      - run: rustup component add clippy
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Initialize CodeQL for Rust
+        uses: github/codeql-action/init@v4.36.0
+        with:
+          languages: rust
+          build-mode: none
+      - name: Analyze Rust sources
+        uses: github/codeql-action/analyze@v4.36.0
 
   container-scan:
     name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: container-scan' || 'container-scan' }}"
@@ -126,7 +201,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: test -z "$(find . -path './target' -prune -o -name Dockerfile -print -quit)"
+      - name: Build the deployed Control API image
+        run: docker build --file compose/Dockerfile.control-api --tag openwork-control-api:ci .
+      - name: Scan the deployed image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: openwork-control-api:ci
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: CRITICAL
 
   docs-links:
     name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: docs-links' || 'docs-links' }}"

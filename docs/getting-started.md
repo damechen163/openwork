@@ -1,13 +1,35 @@
 # Getting started
 
-The Bootstrap Runtime is a native developer preview. It does not install the
-broader OpenWork service stack.
+OpenWork is an enterprise AI agent execution control plane under active M1
+integration. The deterministic M1 demo uses a real Docker container and no
+provider credentials or external side effects. The published binary release is
+still the earlier Bootstrap Runtime developer preview.
 
 ## Developer requirements
 
 - Rust 1.95 or newer for source builds
 - Git for source checkout and selected runtime workflows
 - Docker is optional and reported as `SKIP` when absent
+
+## Repeat the M1 demo from source
+
+Start Docker, then run:
+
+```bash
+./scripts/demo-m1.sh
+```
+
+The script builds the CLI, runs Doctor, executes the digest-pinned sales
+analysis container, verifies artifacts and audit, and exercises automatic,
+approval-required, replay/tamper, and destructive-denial policy paths with a
+side-effect-free mock action executor. Outputs are retained below
+`openwork-demo-output/` unless `OPENWORK_DEMO_OUTPUT_ROOT` is set to another
+absolute directory. No email is sent.
+
+See [CURRENT_STATE.md](../CURRENT_STATE.md) before treating this demo as proof
+of a generic queued-run worker or real Claude Code/Codex provider execution.
+
+## Bootstrap CLI commands
 
 ```bash
 cargo test --workspace

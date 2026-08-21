@@ -1,5 +1,6 @@
 //! Deterministic fixtures and validators for the M1 safe-execution demo.
 
+pub mod sales_demo;
 pub mod scenario;
 
 use sha2::{Digest, Sha256};
@@ -8,8 +9,9 @@ use std::fmt::{self, Write as _};
 use std::fs;
 use std::path::{Component, Path};
 
-const HEADER: &str = "customer_id,customer_name,sales";
+const HEADER: &str = "customer_id,customer_name,sales,orders";
 const MAX_SALES: i64 = 1_000_000_000_000;
+const MAX_ORDERS: i64 = 1_000_000_000;
 
 /// Static, content-free fixture validation error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,6 +29,7 @@ impl std::error::Error for FixtureError {}
 struct MonthlySale {
     customer_name: String,
     sales: i64,
+    orders: i64,
 }
 
 /// One deterministically ordered customer comparison.
@@ -40,6 +43,14 @@ pub struct CustomerAnalysis {
     pub decline: i64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CustomerMetrics {
+    july_orders: i64,
+    august_orders: i64,
+    growth_basis_points: i64,
+    order_change: i64,
+}
+
 /// Complete exact analysis used to render both golden outputs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SalesAnalysis {
@@ -48,6 +59,12 @@ pub struct SalesAnalysis {
     august_total: i64,
     change: i64,
     decline: i64,
+    july_orders: i64,
+    august_orders: i64,
+    order_change: i64,
+    growth_basis_points: i64,
+    order_growth_basis_points: i64,
+    customer_metrics: Vec<CustomerMetrics>,
 }
 
 impl SalesAnalysis {
@@ -73,25 +90,37 @@ impl SalesAnalysis {
 
     #[must_use]
     pub fn render_csv(&self) -> String {
-        let mut output =
-            String::from("customer_id,customer_name,july_sales,august_sales,change,decline\n");
-        for row in &self.customers {
+        let mut output = String::from(
+            "customer_id,customer_name,july_sales,july_orders,august_sales,august_orders,sales_change,sales_decline,sales_growth_rate,order_change\n",
+        );
+        for (row, metrics) in self.customers.iter().zip(&self.customer_metrics) {
             writeln!(
                 output,
-                "{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{}",
                 row.customer_id,
                 row.customer_name,
                 row.july_sales,
+                metrics.july_orders,
                 row.august_sales,
+                metrics.august_orders,
                 row.change,
-                row.decline
+                row.decline,
+                format_rate(metrics.growth_basis_points),
+                metrics.order_change
             )
             .expect("writing to a string cannot fail");
         }
         writeln!(
             output,
-            "TOTAL,,{},{},{},{}",
-            self.july_total, self.august_total, self.change, self.decline
+            "TOTAL,,{},{},{},{},{},{},{},{}",
+            self.july_total,
+            self.july_orders,
+            self.august_total,
+            self.august_orders,
+            self.change,
+            self.decline,
+            format_rate(self.growth_basis_points),
+            self.order_change
         )
         .expect("writing to a string cannot fail");
         output
@@ -110,14 +139,24 @@ impl SalesAnalysis {
         let acme = self.customer("Acme")?;
         let beta = self.customer("Beta")?;
         let delta = self.customer("Delta")?;
+        let largest_metrics = self
+            .customer_metrics
+            .first()
+            .ok_or(FixtureError("analysis metrics are incomplete"))?;
         Ok(format!(
-            "# Sales comparison\n\n- July total: {}\n- August total: {}\n- Change: {}\n- Largest decline: {} ({}), {}\n- Acme decline: {}\n- Beta growth: {}\n- Delta change: {}\n",
+            "# Sales comparison\n\n- July sales total: {}\n- August sales total: {}\n- Sales change: {} ({})\n- July order count: {}\n- August order count: {}\n- Order change: {} ({})\n- Largest sales decline: {} ({}), {} ({})\n- Acme sales decline: {}\n- Beta sales growth: {}\n- Delta sales change: {}\n",
             self.july_total,
             self.august_total,
             self.change,
+            format_rate(self.growth_basis_points),
+            self.july_orders,
+            self.august_orders,
+            self.order_change,
+            format_rate(self.order_growth_basis_points),
             largest.customer_name,
             largest.customer_id,
             largest.decline,
+            format_rate(largest_metrics.growth_basis_points),
             acme.decline,
             beta.change,
             delta.change
@@ -144,6 +183,7 @@ pub fn analyze(july: &str, august: &str) -> Result<SalesAnalysis, FixtureError> 
         return Err(FixtureError("monthly customer sets differ"));
     }
     let mut customers = Vec::with_capacity(july.len());
+    let mut metrics_by_customer = BTreeMap::new();
     for (customer_id, july_sale) in july {
         let august_sale = august
             .get(&customer_id)
@@ -155,6 +195,19 @@ pub fn analyze(july: &str, august: &str) -> Result<SalesAnalysis, FixtureError> 
             .sales
             .checked_sub(july_sale.sales)
             .ok_or(FixtureError("sales arithmetic overflow"))?;
+        let order_change = august_sale
+            .orders
+            .checked_sub(july_sale.orders)
+            .ok_or(FixtureError("order arithmetic overflow"))?;
+        metrics_by_customer.insert(
+            customer_id.clone(),
+            CustomerMetrics {
+                july_orders: july_sale.orders,
+                august_orders: august_sale.orders,
+                growth_basis_points: growth_basis_points(change, july_sale.sales)?,
+                order_change,
+            },
+        );
         customers.push(CustomerAnalysis {
             customer_id,
             customer_name: july_sale.customer_name,
@@ -184,6 +237,28 @@ pub fn analyze(july: &str, august: &str) -> Result<SalesAnalysis, FixtureError> 
     let change = august_total
         .checked_sub(july_total)
         .ok_or(FixtureError("sales arithmetic overflow"))?;
+    let july_orders = checked_total(
+        metrics_by_customer
+            .values()
+            .map(|metrics| metrics.july_orders),
+    )?;
+    let august_orders = checked_total(
+        metrics_by_customer
+            .values()
+            .map(|metrics| metrics.august_orders),
+    )?;
+    let order_change = august_orders
+        .checked_sub(july_orders)
+        .ok_or(FixtureError("order arithmetic overflow"))?;
+    let customer_metrics = customers
+        .iter()
+        .map(|customer| {
+            metrics_by_customer
+                .get(&customer.customer_id)
+                .copied()
+                .ok_or(FixtureError("analysis metrics are incomplete"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(SalesAnalysis {
         customers,
         july_total,
@@ -192,6 +267,12 @@ pub fn analyze(july: &str, august: &str) -> Result<SalesAnalysis, FixtureError> 
         decline: change
             .checked_neg()
             .ok_or(FixtureError("sales arithmetic overflow"))?,
+        july_orders,
+        august_orders,
+        order_change,
+        growth_basis_points: growth_basis_points(change, july_total)?,
+        order_growth_basis_points: growth_basis_points(order_change, july_orders)?,
+        customer_metrics,
     })
 }
 
@@ -265,23 +346,31 @@ fn parse_month(input: &str) -> Result<BTreeMap<String, MonthlySale>, FixtureErro
     let mut sales = BTreeMap::new();
     for line in lines {
         let fields = line.split(',').collect::<Vec<_>>();
-        if fields.len() != 3
+        if fields.len() != 4
             || !valid_customer_id(fields[0])
             || !valid_customer_name(fields[1])
             || !fields[2].bytes().all(|byte| byte.is_ascii_digit())
+            || !fields[3].bytes().all(|byte| byte.is_ascii_digit())
         {
             return Err(FixtureError("sales CSV row is invalid"));
         }
         let amount = fields[2]
             .parse::<i64>()
             .map_err(|_| FixtureError("sales number is invalid"))?;
-        if amount > MAX_SALES
+        let orders = fields[3]
+            .parse::<i64>()
+            .map_err(|_| FixtureError("order count is invalid"))?;
+        if amount == 0
+            || amount > MAX_SALES
+            || orders == 0
+            || orders > MAX_ORDERS
             || sales
                 .insert(
                     fields[0].to_owned(),
                     MonthlySale {
                         customer_name: fields[1].to_owned(),
                         sales: amount,
+                        orders,
                     },
                 )
                 .is_some()
@@ -293,6 +382,30 @@ fn parse_month(input: &str) -> Result<BTreeMap<String, MonthlySale>, FixtureErro
         return Err(FixtureError("sales CSV has no customers"));
     }
     Ok(sales)
+}
+
+fn growth_basis_points(change: i64, baseline: i64) -> Result<i64, FixtureError> {
+    let magnitude = change
+        .checked_abs()
+        .ok_or(FixtureError("growth arithmetic overflow"))?;
+    let scaled = magnitude
+        .checked_mul(10_000)
+        .and_then(|value| value.checked_add(baseline / 2))
+        .ok_or(FixtureError("growth arithmetic overflow"))?
+        / baseline;
+    if change < 0 {
+        scaled
+            .checked_neg()
+            .ok_or(FixtureError("growth arithmetic overflow"))
+    } else {
+        Ok(scaled)
+    }
+}
+
+fn format_rate(basis_points: i64) -> String {
+    let sign = if basis_points < 0 { "-" } else { "" };
+    let magnitude = basis_points.unsigned_abs();
+    format!("{sign}{}.{:02}%", magnitude / 100, magnitude % 100)
 }
 
 fn checked_total(mut values: impl Iterator<Item = i64>) -> Result<i64, FixtureError> {
