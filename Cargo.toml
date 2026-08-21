@@ -1,14 +1,17 @@
 [workspace]
 members = [
   "crates/openwork-cli",
+  "crates/openwork-control-api",
   "crates/openwork-config",
   "crates/openwork-core",
   "crates/openwork-doctor",
+  "crates/openwork-e2e",
   "crates/openwork-execution",
   "crates/openwork-installer",
   "crates/openwork-platform",
   "crates/openwork-policy",
   "crates/openwork-runtime",
+  "crates/openwork-sandbox",
 ]
 resolver = "2"
 

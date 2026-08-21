@@ -2,6 +2,38 @@
 
 This file is updated before each development session ends.
 
+## 2026-08-11 — M1 Vertical Slice Integration
+
+- Merged Sandbox stack (#70-#73): DockerSandbox backend with hardened containers,
+  deterministic FakeDockerCli tests, triple-guard cleanup.
+- Merged Runtime task adapters (#88-#89): ClaudeTaskAdapter and CodexTaskAdapter
+  with strict JSONL decoder, stdin-based prompt delivery, 9 protocol tests.
+- Extended SandboxCommand contract: added bounded stdin field (1 MiB limit) with
+  backward-compatible `new()` defaulting to empty.
+- Added stdin piping to SystemDockerCli: Docker containers receive stdin via
+  `-i` (create) and `-a -i` (start) flags with background writer thread.
+- Built RuntimeInvocation → SandboxRequest bridge (`into_sandbox_request()`):
+  single conversion point merging adapter stdin into the sandbox command.
+- Wired ExecutionOrchestrator::execute(): full run lifecycle — CAS-transition
+  to Running, sandbox execution, artifact scanning, terminal status recording.
+- Merged E2E sales fixtures (#82): deterministic analysis, golden CSV/markdown,
+  SHA-256 hashing, traversal-safe fixture loader.
+- Merged E2E policy scenarios (#81): L3 risky-email-send.json, L4
+  destructive-database-delete.json with frozen parameter hashes.
+- 90+ tests pass including sandbox, runtime task, E2E, and all existing suites.
+- Pushed `opencat/m1-vertical-slice` branch with 8 commits for PR.
+
+### Remaining for First Usable Alpha
+- Merge Control API stack (#76-#80): Cargo.lock conflict needs resolution
+- Implement Postgres-backed ExecutionStore and ApprovalRepository
+- Wire Control API POST mutations (currently 503 stubs)
+- Fix undocumented Claude/Codex CLI flags (`--no-chrome`, `--disable-slash-commands`,
+  `--strict-config`)
+- Add real Docker daemon CI validation
+- Build complete E2E vertical slice pipeline test (orchestrator → sandbox → artifacts)
+- Security, QA, Architecture reviews
+- Publish v0.2.0-alpha.1 release
+
 ## 2026-08-10 — Phase 0 bootstrap
 
 - Read the full 2,252-line construction prompt and limited implementation to Phase 0.

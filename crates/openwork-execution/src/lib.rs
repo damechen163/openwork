@@ -25,6 +25,7 @@ pub const MAX_ACTION_PARAMETER_BYTES: usize = 64 * 1024;
 pub const MAX_ACTION_PARAMETER_DEPTH: usize = 32;
 pub const MAX_APPROVAL_TTL_SECONDS: i128 = 24 * 60 * 60;
 pub const MAX_SANDBOX_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_SANDBOX_STDIN_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SchemaVersion;
@@ -72,6 +73,17 @@ macro_rules! uuid_v7_id {
                     return Err(invalid_contract("execution IDs must be UUIDv7"));
                 }
                 Ok(Self(uuid))
+            }
+
+            #[must_use]
+            pub fn to_hyphenated(&self) -> String {
+                self.0.as_hyphenated().to_string()
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0.as_hyphenated())
             }
         }
 
@@ -251,6 +263,11 @@ impl SandboxWorkingDirectory {
             ));
         }
         Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -629,12 +646,28 @@ impl<'de> Deserialize<'de> for DigestPinnedImageRef {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxCommand {
     program: String,
     arguments: Vec<String>,
     environment: BTreeMap<String, String>,
+    #[serde(skip_serializing)]
+    stdin: Vec<u8>,
+}
+
+impl std::fmt::Debug for SandboxCommand {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let environment_keys: Vec<&str> = self.environment.keys().map(String::as_str).collect();
+        formatter
+            .debug_struct("SandboxCommand")
+            .field("program", &self.program)
+            .field("arguments", &self.arguments)
+            .field("environment_keys", &environment_keys)
+            .field("stdin", &"<redacted>")
+            .field("stdin_bytes", &self.stdin.len())
+            .finish()
+    }
 }
 
 impl SandboxCommand {
@@ -643,6 +676,20 @@ impl SandboxCommand {
         program: impl Into<String>,
         arguments: Vec<String>,
         environment: BTreeMap<String, String>,
+    ) -> Result<Self, OpenWorkError> {
+        Self::with_stdin(program, arguments, environment, Vec::new())
+    }
+
+    /// Creates a command with optional stdin bytes for the container process.
+    ///
+    /// Stdin is bounded at 1 MiB to prevent unbounded prompt injection through
+    /// the sandbox boundary. Most provider prompts fit well within this limit.
+    #[allow(clippy::missing_errors_doc)]
+    pub fn with_stdin(
+        program: impl Into<String>,
+        arguments: Vec<String>,
+        environment: BTreeMap<String, String>,
+        stdin: Vec<u8>,
     ) -> Result<Self, OpenWorkError> {
         let program = program.into();
         let valid_program = program.starts_with('/')
@@ -660,15 +707,17 @@ impl SandboxCommand {
             && environment.iter().all(|(key, value)| {
                 valid_environment_name(key) && value.len() <= 8192 && !value.contains('\0')
             });
-        if !valid_program || !arguments_valid || !environment_valid {
+        let stdin_valid = stdin.len() <= MAX_SANDBOX_STDIN_BYTES;
+        if !valid_program || !arguments_valid || !environment_valid || !stdin_valid {
             return Err(invalid_contract(
-                "sandbox command must use an absolute program and bounded argv/environment allowlist",
+                "sandbox command must use an absolute program and bounded argv/environment/stdin allowlist",
             ));
         }
         Ok(Self {
             program,
             arguments,
             environment,
+            stdin,
         })
     }
 
@@ -686,6 +735,11 @@ impl SandboxCommand {
     pub const fn environment(&self) -> &BTreeMap<String, String> {
         &self.environment
     }
+
+    #[must_use]
+    pub fn stdin(&self) -> &[u8] {
+        &self.stdin
+    }
 }
 
 #[derive(Deserialize)]
@@ -694,6 +748,8 @@ struct SandboxCommandWire {
     program: String,
     arguments: Vec<String>,
     environment: BTreeMap<String, String>,
+    #[serde(default)]
+    stdin: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for SandboxCommand {
@@ -702,7 +758,11 @@ impl<'de> Deserialize<'de> for SandboxCommand {
         D: Deserializer<'de>,
     {
         let wire = SandboxCommandWire::deserialize(deserializer)?;
-        Self::new(wire.program, wire.arguments, wire.environment).map_err(serde::de::Error::custom)
+        let stdin = wire
+            .stdin
+            .map_or_else(Vec::new, std::string::String::into_bytes);
+        Self::with_stdin(wire.program, wire.arguments, wire.environment, stdin)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -1337,7 +1397,7 @@ impl<'de> Deserialize<'de> for ApprovalRequest {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeTask {
     pub schema_version: SchemaVersion,
@@ -1348,6 +1408,22 @@ pub struct RuntimeTask {
     pub working_directory: SandboxWorkingDirectory,
     pub timeout_seconds: u64,
     pub capabilities: Vec<String>,
+}
+
+impl std::fmt::Debug for RuntimeTask {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeTask")
+            .field("schema_version", &self.schema_version)
+            .field("run_id", &self.run_id)
+            .field("runtime", &self.runtime)
+            .field("prompt", &"<redacted>")
+            .field("prompt_hash", &self.prompt_hash)
+            .field("working_directory", &self.working_directory)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .field("capabilities", &self.capabilities)
+            .finish()
+    }
 }
 
 impl RuntimeTask {
@@ -1842,6 +1918,27 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn sandbox_command_debug_and_serialization_redact_stdin() {
+        let prompt = "private prompt sentinel";
+        let command = SandboxCommand::with_stdin(
+            "/usr/bin/mock-runtime",
+            vec!["run".to_owned()],
+            BTreeMap::from([("SAFE_SETTING".to_owned(), "private-env-value".to_owned())]),
+            prompt.as_bytes().to_vec(),
+        )
+        .expect("command");
+
+        let debug = format!("{command:?}");
+        assert!(!debug.contains(prompt));
+        assert!(!debug.contains("private-env-value"));
+        assert!(debug.contains("stdin_bytes"));
+
+        let serialized = serde_json::to_value(command).expect("serialize command");
+        assert!(serialized.get("stdin").is_none());
+        assert!(!serialized.to_string().contains(prompt));
     }
 
     #[test]

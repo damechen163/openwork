@@ -11,12 +11,17 @@ openwork-core = { path = "../openwork-core" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+sqlx = { version = "=0.8.6", default-features = false, features = ["postgres", "runtime-tokio-rustls", "time", "uuid"], optional = true }
 time.workspace = true
+tokio = { version = "=1.53.1", features = ["rt", "rt-multi-thread"], optional = true }
 uuid.workspace = true
 
 [dev-dependencies]
 jsonschema.workspace = true
 tempfile.workspace = true
+
+[features]
+postgres = ["dep:sqlx", "dep:tokio"]
 
 [lints]
 workspace = true

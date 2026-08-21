@@ -5,7 +5,7 @@ use crate::audit::AuditAppend;
 use crate::store::ExecutionStore;
 use crate::{
     ActorId, Artifact, EXECUTION_SCHEMA_VERSION, RelativeArtifactPath, Run, RunId, RunStatus,
-    UtcTimestamp, sha256_bytes,
+    SandboxBackend, SandboxRequest, UtcTimestamp, sha256_bytes,
 };
 use openwork_core::{ErrorCode, OpenWorkError};
 use std::fs;
@@ -106,10 +106,156 @@ impl<S: ExecutionStore> ExecutionOrchestrator<S> {
         Ok(artifacts)
     }
 
+    /// Executes a prepared sandbox request within the run lifecycle.
+    ///
+    /// Transitions the run to Running, delegates to the sandbox backend,
+    /// scans validated output artifacts, and records the terminal status
+    /// with full audit trail. This is the primary execution path for M1.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a stale run revision, illegal transition,
+    /// sandbox failure, invalid output, or persistence failure.
+    pub fn execute(
+        &self,
+        run: &Run,
+        sandbox: &dyn SandboxBackend,
+        request: &SandboxRequest,
+        actor: ActorId,
+        now: UtcTimestamp,
+    ) -> Result<Run, OpenWorkError> {
+        if run.id != request.run_id {
+            return Err(OpenWorkError::new(
+                ErrorCode::ExecutionFailed,
+                "sandbox request does not match run",
+            ));
+        }
+
+        // A newly created run is Queued. Record the explicit planning step
+        // before entering Running so the primary execution path obeys the
+        // public state machine without requiring callers to mutate the run.
+        let run = if run.status == RunStatus::Queued {
+            self.transition(
+                &run.id,
+                run.revision,
+                RunStatus::Planning,
+                None,
+                actor.clone(),
+                now,
+            )?
+        } else {
+            run.clone()
+        };
+
+        // Transition Planning → Running.
+        let run = self.transition(
+            &run.id,
+            run.revision,
+            RunStatus::Running,
+            None,
+            actor.clone(),
+            now,
+        )?;
+
+        // Execute in sandbox
+        let result = sandbox
+            .execute(request)
+            .and_then(|result| validate_sandbox_result(&run.id, result))
+            .inspect_err(|_error| {
+                // Best-effort: record the failure as a terminal event.
+                // run.revision is the current revision from the first transition.
+                let _ = self.store.transition_run(
+                    &run.id,
+                    run.revision,
+                    RunStatus::Failed,
+                    Some("sandbox execution failed"),
+                    audit(actor.clone(), UtcTimestamp::now()),
+                );
+            })?;
+
+        // Scan output artifacts (only when the container exited cleanly)
+        let completed_at = UtcTimestamp::now();
+        let exited_clean = matches!(result.termination, crate::SandboxTermination::Exited);
+        let _artifacts = if exited_clean {
+            match self.record_artifacts(
+                &run.id,
+                request.output_directory.as_path(),
+                &result.output_paths,
+                actor.clone(),
+                completed_at,
+            ) {
+                Ok(artifacts) => artifacts,
+                Err(error) => {
+                    let _ = self.store.transition_run(
+                        &run.id,
+                        run.revision,
+                        RunStatus::Failed,
+                        Some("artifact validation failed"),
+                        audit(actor, completed_at),
+                    );
+                    return Err(error);
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        // Determine terminal status
+        let (terminal, reason) = match result.termination {
+            crate::SandboxTermination::Exited if result.exit_code == Some(0) => {
+                (RunStatus::Succeeded, None)
+            }
+            crate::SandboxTermination::Exited => (
+                RunStatus::Failed,
+                Some("provider exited with non-zero code"),
+            ),
+            crate::SandboxTermination::Cancelled => {
+                (RunStatus::Cancelled, Some("sandbox was cancelled"))
+            }
+            crate::SandboxTermination::TimedOut => (RunStatus::TimedOut, Some("sandbox timed out")),
+            crate::SandboxTermination::OutOfMemory => {
+                (RunStatus::Failed, Some("sandbox out of memory"))
+            }
+            crate::SandboxTermination::Failed => {
+                (RunStatus::Failed, Some("sandbox execution failed"))
+            }
+        };
+
+        let reason_str: Option<&str> = reason;
+        self.transition(
+            &run.id,
+            run.revision,
+            terminal,
+            reason_str,
+            actor,
+            completed_at,
+        )
+    }
+
     #[must_use]
     pub const fn store(&self) -> &S {
         &self.store
     }
+}
+
+fn validate_sandbox_result(
+    run_id: &RunId,
+    result: crate::SandboxResult,
+) -> Result<crate::SandboxResult, OpenWorkError> {
+    result.validate()?;
+    if &result.run_id != run_id {
+        return Err(OpenWorkError::new(
+            ErrorCode::ExecutionFailed,
+            "sandbox result does not match run",
+        ));
+    }
+    if !matches!(result.cleanup, crate::SandboxCleanupStatus::Succeeded) {
+        return Err(OpenWorkError::new(
+            ErrorCode::ExecutionFailed,
+            "sandbox cleanup failed",
+        ));
+    }
+    Ok(result)
 }
 
 fn audit(actor: ActorId, timestamp: UtcTimestamp) -> AuditAppend {

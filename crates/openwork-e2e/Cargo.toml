@@ -1,5 +1,5 @@
 [package]
-name = "openwork-runtime"
+name = "openwork-e2e"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,13 +7,14 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-openwork-core = { path = "../openwork-core" }
 openwork-execution = { path = "../openwork-execution" }
-openwork-platform = { path = "../openwork-platform" }
-reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+
+[dev-dependencies]
+openwork-core = { path = "../openwork-core" }
+openwork-runtime = { path = "../openwork-runtime" }
 tempfile.workspace = true
 
 [lints]
