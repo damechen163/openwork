@@ -4,7 +4,7 @@
 use openwork_cli::run::{RunPlan, run_loop};
 use openwork_core::{ErrorCode, OpenWorkError};
 use openwork_execution::{
-    AuditEventType, DigestPinnedImageRef, RunStatus, SandboxLimits, SandboxResult,
+    AuditEventType, SandboxBackend, SandboxRequest, DigestPinnedImageRef, RunStatus, SandboxLimits, SandboxResult,
     SandboxTermination, SandboxUser, SchemaVersion, UtcTimestamp,
     artifact::ArtifactScanner,
     orchestrator::ExecutionOrchestrator,
@@ -16,11 +16,81 @@ use openwork_runtime::{
     RuntimeId, RuntimeInstallOutcome, RuntimeInstallPlan, RuntimeMetadata, RuntimeResult,
     RuntimeRunRequest,
 };
-use openwork_sandbox::mock::MockSandboxBackend;
-use std::collections::VecDeque;
+
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+
+/// Minimal test double mirroring the removed openwork-sandbox mock.
+#[derive(Default)]
+struct MockSandboxBackend {
+    outcomes: Mutex<VecDeque<Result<SandboxResult, OpenWorkError>>>,
+    output_files: Mutex<BTreeMap<String, String>>,
+}
+
+impl MockSandboxBackend {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn enqueue(&self, outcome: Result<SandboxResult, OpenWorkError>) {
+        self.outcomes.lock().unwrap().push_back(outcome);
+    }
+
+    fn with_output_file(self, relative_path: &str, content: &str) -> Self {
+        self.output_files
+            .lock()
+            .unwrap()
+            .insert(relative_path.to_owned(), content.to_owned());
+        self
+    }
+}
+
+impl SandboxBackend for MockSandboxBackend {
+    fn health(&self) -> Result<(), OpenWorkError> {
+        Ok(())
+    }
+
+    fn execute(&self, request: &SandboxRequest) -> Result<SandboxResult, OpenWorkError> {
+        let outcome = self
+            .outcomes
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(|| OpenWorkError::new(ErrorCode::Internal, "no scripted outcome"))?;
+        match outcome {
+            Ok(mut result) => {
+                let files = self.output_files.lock().unwrap().clone();
+                std::fs::create_dir_all(request.output_directory.as_path()).unwrap();
+                for (relative, content) in &files {
+                    let path = request.output_directory.as_path().join(relative);
+                    std::fs::write(&path, content).unwrap();
+                }
+                let output_paths: Vec<_> = files
+                    .keys()
+                    .filter_map(|relative| {
+                        openwork_execution::RelativeArtifactPath::parse(relative.clone()).ok()
+                    })
+                    .collect();
+                result.run_id = request.run_id.clone();
+                result.sandbox_id = "mock-sandbox".to_owned();
+                result.output_paths = output_paths;
+                Ok(result)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn cancel(&self, _: &openwork_execution::RunId) -> Result<(), OpenWorkError> {
+        Ok(())
+    }
+
+    fn cleanup(&self, _: &openwork_execution::RunId) -> Result<(), OpenWorkError> {
+        Ok(())
+    }
+}
 
 struct FakeRuntime {
     events: Mutex<VecDeque<Result<Vec<RuntimeEvent>, OpenWorkError>>>,
