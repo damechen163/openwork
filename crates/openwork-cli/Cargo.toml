@@ -20,7 +20,6 @@ openwork-execution = { path = "../openwork-execution" }
 openwork-installer = { path = "../openwork-installer" }
 openwork-platform = { path = "../openwork-platform" }
 openwork-runtime = { path = "../openwork-runtime" }
-openwork-execution = { path = "../openwork-execution" }
 openwork-e2e = { path = "../openwork-e2e" }
 openwork-policy = { path = "../openwork-policy" }
 openwork-sandbox = { path = "../openwork-sandbox" }

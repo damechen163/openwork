@@ -7,7 +7,14 @@ use openwork_config::{
 use openwork_core::{ErrorCode, OpenWorkError, PRODUCT_NAME};
 use openwork_doctor::{CheckStatus, DoctorReport, inspect_platform};
 use openwork_e2e::sales_demo::{SalesDemoConfig, SalesDemoReport, run_sales_demo};
-use openwork_execution::DigestPinnedImageRef;
+use openwork_execution::{
+    DigestPinnedImageRef, SandboxBackend, SandboxLimits, SandboxUser, artifact::ArtifactScanner,
+    orchestrator::ExecutionOrchestrator, store::InMemoryExecutionStore,
+};
+use std::sync::Mutex;
+use std::time::Duration;
+
+mod run;
 use openwork_installer::{
     ExecutionMode, InstallExecutionFailure, InstallExecutionReport, InstallExecutor, InstallPlan,
     StepResult, StepStatus, dry_run_plan, managed_runtime_plan,
@@ -607,8 +614,12 @@ fn execute_run(
             )
         })?;
 
-    let user = SandboxUser::new(SANDBOX_UID, SANDBOX_GID).map_err(|error| (error, json))?;
-    let image = DigestPinnedImageRef::parse(SANDBOX_IMAGE).map_err(|error| (error, json))?;
+    let user =
+        SandboxUser::new(1000, 1000).map_err(|error| (error, json))?;
+    let image = DigestPinnedImageRef::parse(
+        "docker.io/library/python@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36",
+    )
+    .map_err(|error| (error, json))?;
     let limits = SandboxLimits::new(30_000, 512 * 1024 * 1024, 512, sandbox_timeout, 16 * 1024 * 1024)
         .map_err(|error| (error, json))?;
 
@@ -626,7 +637,16 @@ fn execute_run(
     let scanner =
         ArtifactScanner::new(100 * 1024 * 1024).map_err(|error| (error, json))?;
     let orchestrator = ExecutionOrchestrator::new(store, scanner);
-    let backend = Arc::new(PodmanSandboxBackend::new(Arc::new(SystemCommandRunner)));
+    let engine_bin = resolve_container_engine(None).map_err(|error| (error, json))?;
+    let temporary_root = std::env::temp_dir().join("openwork-sandbox-runs");
+    std::fs::create_dir_all(&temporary_root)
+        .map_err(|error| (OpenWorkError::new(ErrorCode::Io, error.to_string()), json))?;
+    let cli = openwork_sandbox::SystemPodmanCli::new(engine_bin)
+        .map_err(|error| (error, json))?;
+    let backend: Arc<dyn SandboxBackend> = Arc::new(openwork_sandbox::PodmanSandbox::new(
+        Arc::new(cli),
+        temporary_root,
+    ));
     let token = openwork_runtime::CancellationToken::new();
     let active_run_id: Arc<Mutex<Option<openwork_execution::RunId>>> =
         Arc::new(Mutex::new(None));
@@ -652,6 +672,9 @@ fn execute_run(
     let register_run_id = |run_id: &openwork_execution::RunId| {
         *active_run_id.lock().expect("run id mutex poisoned") = Some(run_id.clone());
     };
+    let report_progress = |phase: &str| {
+        eprintln!("[openwork] {phase}");
+    };
     let report = run::run_loop(
         &orchestrator,
         runtime_ref.as_ref(),
@@ -659,6 +682,7 @@ fn execute_run(
         &token,
         &plan,
         &register_run_id,
+        &report_progress,
     )
     .map_err(|error| {
         *active_run_id.lock().expect("run id mutex poisoned") = None;
@@ -945,4 +969,25 @@ fn render_doctor(report: &DoctorReport, json: bool) {
         "Summary: {} pass, {} warn, {} fail, {} skip",
         report.summary.pass, report.summary.warn, report.summary.fail, report.summary.skip
     );
+}
+
+
+fn render_run(report: &run::RunReport, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(report).unwrap_or_default()
+        );
+        return;
+    }
+    println!("Run {}: {:?}", report.run_id, report.status);
+    for artifact in &report.artifacts {
+        println!(
+            "artifact {} {} {} bytes sha256:{}",
+            artifact.path.as_str(),
+            artifact.media_type,
+            serde_json::to_string(&artifact.size_bytes).unwrap_or_default(),
+            artifact.sha256.as_str()
+        );
+    }
 }
