@@ -4,8 +4,8 @@
 use openwork_cli::run::{RunPlan, run_loop};
 use openwork_core::{ErrorCode, OpenWorkError};
 use openwork_execution::{
-    AuditEventType, SandboxBackend, SandboxRequest, DigestPinnedImageRef, RunStatus, SandboxLimits, SandboxResult,
-    SandboxTermination, SandboxUser, SchemaVersion, UtcTimestamp,
+    AuditEventType, DigestPinnedImageRef, RunStatus, SandboxBackend, SandboxLimits, SandboxRequest,
+    SandboxResult, SandboxTermination, SandboxUser, SchemaVersion, UtcTimestamp,
     artifact::ArtifactScanner,
     orchestrator::ExecutionOrchestrator,
     store::{ExecutionStore, InMemoryExecutionStore},
@@ -21,7 +21,6 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
 
 /// Minimal test double mirroring the removed openwork-sandbox mock.
 #[derive(Default)]
@@ -75,7 +74,7 @@ impl SandboxBackend for MockSandboxBackend {
                     })
                     .collect();
                 result.run_id = request.run_id.clone();
-                result.sandbox_id = "mock-sandbox".to_owned();
+                let _ = std::mem::replace(&mut result.sandbox_id, "mock-sandbox".to_owned());
                 result.output_paths = output_paths;
                 Ok(result)
             }

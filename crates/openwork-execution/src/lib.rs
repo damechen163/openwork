@@ -100,7 +100,6 @@ macro_rules! uuid_v7_id {
                 Ok(Self(uuid))
             }
         }
-
     };
 }
 

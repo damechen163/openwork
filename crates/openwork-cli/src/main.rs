@@ -210,6 +210,7 @@ fn run(cli: Cli, probe: &impl PlatformProbe) -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute(cli: Cli, probe: &impl PlatformProbe) -> Result<u8, (OpenWorkError, bool)> {
     match cli.command {
         Command::Install {
@@ -268,7 +269,14 @@ fn execute(cli: Cli, probe: &impl PlatformProbe) -> Result<u8, (OpenWorkError, b
             timeout,
             sandbox_timeout,
             json,
-        } => execute_run(&runtime, &workspace, &prompt, timeout, sandbox_timeout, json),
+        } => execute_run(
+            &runtime,
+            &workspace,
+            &prompt,
+            timeout,
+            sandbox_timeout,
+            json,
+        ),
         Command::Demo { command } => execute_demo(command),
         Command::Runtime {
             command: RuntimeCommand::Info { id, json },
@@ -614,14 +622,19 @@ fn execute_run(
             )
         })?;
 
-    let user =
-        SandboxUser::new(1000, 1000).map_err(|error| (error, json))?;
+    let user = SandboxUser::new(1000, 1000).map_err(|error| (error, json))?;
     let image = DigestPinnedImageRef::parse(
         "docker.io/library/python@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36",
     )
     .map_err(|error| (error, json))?;
-    let limits = SandboxLimits::new(30_000, 512 * 1024 * 1024, 512, sandbox_timeout, 16 * 1024 * 1024)
-        .map_err(|error| (error, json))?;
+    let limits = SandboxLimits::new(
+        30_000,
+        512 * 1024 * 1024,
+        512,
+        sandbox_timeout,
+        16 * 1024 * 1024,
+    )
+    .map_err(|error| (error, json))?;
 
     let plan = run::RunPlan {
         workspace: std::path::PathBuf::from(workspace),
@@ -634,28 +647,29 @@ fn execute_run(
     };
 
     let store = InMemoryExecutionStore::default();
-    let scanner =
-        ArtifactScanner::new(100 * 1024 * 1024).map_err(|error| (error, json))?;
+    let scanner = ArtifactScanner::new(100 * 1024 * 1024).map_err(|error| (error, json))?;
     let orchestrator = ExecutionOrchestrator::new(store, scanner);
     let engine_bin = resolve_container_engine(None).map_err(|error| (error, json))?;
     let temporary_root = std::env::temp_dir().join("openwork-sandbox-runs");
     std::fs::create_dir_all(&temporary_root)
         .map_err(|error| (OpenWorkError::new(ErrorCode::Io, error.to_string()), json))?;
-    let cli = openwork_sandbox::SystemPodmanCli::new(engine_bin)
-        .map_err(|error| (error, json))?;
+    let cli = openwork_sandbox::SystemPodmanCli::new(engine_bin).map_err(|error| (error, json))?;
     let backend: Arc<dyn SandboxBackend> = Arc::new(openwork_sandbox::PodmanSandbox::new(
         Arc::new(cli),
         temporary_root,
     ));
     let token = openwork_runtime::CancellationToken::new();
-    let active_run_id: Arc<Mutex<Option<openwork_execution::RunId>>> =
-        Arc::new(Mutex::new(None));
+    let active_run_id: Arc<Mutex<Option<openwork_execution::RunId>>> = Arc::new(Mutex::new(None));
     let signal_token = token.clone();
     let signal_backend = backend.clone();
     let signal_run_id = active_run_id.clone();
     ctrlc::set_handler(move || {
         signal_token.cancel();
-        if let Some(run_id) = signal_run_id.lock().expect("run id mutex poisoned").as_ref() {
+        if let Some(run_id) = signal_run_id
+            .lock()
+            .expect("run id mutex poisoned")
+            .as_ref()
+        {
             let _ = signal_backend.cancel(run_id);
         }
     })
@@ -970,7 +984,6 @@ fn render_doctor(report: &DoctorReport, json: bool) {
         report.summary.pass, report.summary.warn, report.summary.fail, report.summary.skip
     );
 }
-
 
 fn render_run(report: &run::RunReport, json: bool) {
     if json {
